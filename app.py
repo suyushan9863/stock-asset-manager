@@ -141,20 +141,16 @@ def get_usdtwd():
         return p if p and not pd.isna(p) else 32.5
     except: return 32.5
 
-# --- 修正版：取得歷史區間的標的走勢 (加入緩衝與備援) ---
+# --- 修正版 2.0：取得歷史區間的標的走勢 ---
 @st.cache_data(ttl=3600)
 def get_benchmark_history(ticker, start_date, end_date):
     try:
-        # 1. 緩衝：起始日往前推 7 天，避免因為假日導致抓不到起點
-        safe_start = start_date - timedelta(days=7)
+        # 策略 1: 直接抓取較長區間 (1年)，確保一定有資料，然後再切分
+        # 這樣比指定短日期區間 (start=..., end=...) 更穩定
+        data = yf.download(ticker, period="2y", progress=False)
         
-        data = yf.download(ticker, start=safe_start, end=end_date, progress=False)
-        
-        # 2. 備援：如果指定日期區間抓不到 (空值)，改用 '1y' 抓最近一年
-        if data.empty:
-            data = yf.download(ticker, period='1y', progress=False)
-
         if not data.empty:
+            # 處理 MultiIndex
             if isinstance(data.columns, pd.MultiIndex):
                 try: df = data.xs('Close', level=0, axis=1)
                 except: df = data['Close']
@@ -166,12 +162,16 @@ def get_benchmark_history(ticker, start_date, end_date):
             else:
                 df = df[['Close']]
                 
+            # 移除時區並標準化
             df.index = pd.to_datetime(df.index).normalize()
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             
-            # 3. 過濾：只回傳使用者需要的日期區間
-            df = df[df.index >= start_date]
+            # 根據使用者的起始日進行過濾
+            # 稍微往前多抓幾天避免邊界問題
+            mask = (df.index >= (start_date - timedelta(days=5)))
+            df = df.loc[mask]
+            
             return df
     except Exception as e: 
         print(f"Benchmark Error: {e}")
@@ -452,6 +452,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         with tab1:
             if final_rows:
                 df = pd.DataFrame(final_rows)
+                # 重新排列欄位順序以符合您的圖片
                 cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
                 df = df[cols]
                 styler = df.style.format({
@@ -495,6 +496,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                         if not dfh.empty:
                             start_date = dfh.index.min()
                             end_date = datetime.now()
+                            # 使用修正後的函式抓取資料
                             bench_df = get_benchmark_history(bench_ticker, start_date, end_date)
 
                             if bench_df is not None and not bench_df.empty:
@@ -511,7 +513,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                                     fig.update_layout(title=f"資產成長 vs {bench_name}", xaxis_title="日期", yaxis_title="累計報酬率 (%)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                                     st.plotly_chart(fig, use_container_width=True)
                                 else: st.warning("⚠️ 無法繪圖：起始日大盤資料缺失，請嘗試手動補齊昨日資料。")
-                            else: st.warning(f"無法取得 {bench_name} 歷史資料")
+                            else: st.warning(f"無法取得 {bench_name} 歷史資料 (Yahoo Finance 暫時無回應，請稍後再試)")
                         else: st.info("尚無歷史資料")
                     else: st.info("💡 這是新版程式，歷史資料已重置。請每天按一次更新，兩天後就會出現走勢圖。")
             else: st.error("無法讀取歷史")
