@@ -4,9 +4,8 @@ import yfinance as yf
 import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timedelta
+from datetime import datetime
 import plotly.express as px
-import plotly.graph_objects as go
 
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家", layout="wide", page_icon="📈")
@@ -21,15 +20,7 @@ STOCK_MAP = {
     'MSFT': '微軟', 'GOOG': '谷歌', 'AMZN': '亞馬遜'
 }
 
-# --- 比較標的清單 ---
-BENCHMARKS = {
-    '台灣加權指數 (以0050代表)': '0050.TW', # 修正：強制用 0050 代表大盤，避免 ^TWII 抓不到
-    'S&P 500 (美股大盤)': '^GSPC',
-    'QQQ (那斯達克100)': 'QQQ',
-    '費城半導體指數': '^SOX'
-}
-
-# --- Google Sheets 連線 ---
+# --- Google Sheets 連線與資料處理 ---
 def get_google_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -105,9 +96,18 @@ def record_history(client, username, net_asset):
     if hist_sheet and net_asset > 0:
         today = datetime.now().strftime('%Y-%m-%d')
         try:
-            last_row = hist_sheet.get_all_values()[-1]
-            if last_row[0] == today: return 
+            # 檢查最後一筆是否為今天，避免重複寫入
+            all_values = hist_sheet.get_all_values()
+            if len(all_values) > 1:
+                last_row = all_values[-1]
+                if last_row[0] == today:
+                    # 如果今天是同一天，更新數值而不是新增一行 (保持最新狀態)
+                    row_index = len(all_values)
+                    hist_sheet.update_cell(row_index, 2, int(net_asset))
+                    return
         except: pass
+        
+        # 如果是新的一天，新增一行
         hist_sheet.append_row([today, int(net_asset)])
 
 # --- 核心計算邏輯 ---
@@ -139,50 +139,6 @@ def get_usdtwd():
         p = fx.fast_info.get('last_price')
         return p if p and not pd.isna(p) else 32.5
     except: return 32.5
-
-# --- 最終修正版：取得歷史區間的標的走勢 ---
-@st.cache_data(ttl=3600)
-def get_benchmark_history(ticker, start_date):
-    try:
-        # 1. 直接抓取過去 2 年，不管起始日，確保一定有資料
-        data = yf.download(ticker, period="2y", progress=False)
-        
-        if not data.empty:
-            # 處理 MultiIndex 結構
-            if isinstance(data.columns, pd.MultiIndex):
-                try: df = data.xs('Close', level=0, axis=1)
-                except: df = data['Close']
-            else:
-                df = data[['Close']]
-            
-            # 確保是 DataFrame
-            if isinstance(df, pd.Series): df = df.to_frame(name='Close')
-            else: df = df[['Close']]
-            
-            # 2. 【關鍵修正】強制將 Index 轉為單純的日期物件 (date object)
-            # 這樣可以忽略所有時區、小時、分鐘的差異
-            df.index = pd.to_datetime(df.index).date
-            
-            # 3. 轉回 DataFrame (因為 .date 屬性會讓它變回 Index)
-            df.index.name = 'Date'
-            
-            # 4. 過濾資料：只保留比 start_date (含前幾天緩衝) 還要新的
-            # 先轉 start_date 為 date 物件
-            if isinstance(start_date, datetime) or isinstance(start_date, pd.Timestamp):
-                start_date_obj = start_date.date()
-            else:
-                start_date_obj = start_date # 假設已經是 date
-            
-            safe_start = start_date_obj - timedelta(days=10)
-            
-            # 使用列表推導式進行過濾 (最穩定的方法)
-            df = df[df.index >= safe_start]
-            
-            return df
-    except Exception as e: 
-        print(f"Benchmark Error: {e}")
-        pass
-    return None
 
 # --- 登入介面 ---
 if 'current_user' not in st.session_state:
@@ -450,7 +406,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
         kp4.metric("🏆 總合損益", f"${int(grand_total_profit):+,}", delta=f"{grand_total_roi:+.2f}%")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 成長比例走勢", "📜 已實現損益"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 淨資產走勢", "📜 已實現損益"])
         def color_profit(val):
             color = 'red' if val > 0 else 'green' if val < 0 else 'black'
             return f'color: {color}'
@@ -458,7 +414,6 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         with tab1:
             if final_rows:
                 df = pd.DataFrame(final_rows)
-                # 重新排列欄位順序以符合您的圖片
                 cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
                 df = df[cols]
                 styler = df.style.format({
@@ -483,53 +438,23 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             else: st.info("無數據")
 
         with tab3:
-            st.caption("ℹ️ 此圖表顯示「累計報酬率 (%)」，起點設為 0%。")
+            st.caption("ℹ️ 此圖顯示您的「淨資產絕對金額」歷史走勢 (資料來源: Google Sheets)。")
             if client:
                 hs = get_user_history_sheet(client, username)
                 if hs:
                     hvals = hs.get_all_values()
                     if len(hvals) > 1:
-                        # 1. 處理使用者歷史資料
+                        # 簡單暴力：只讀取 Google Sheets 畫圖，不依賴任何外部資料
                         dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
-                        # 關鍵：只取日期部分 (YYYY-MM-DD)
-                        dfh['Date'] = pd.to_datetime(dfh['Date']).dt.date
+                        dfh['Date'] = pd.to_datetime(dfh['Date'])
                         dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
-                        dfh = dfh.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
-                        dfh = dfh.set_index('Date')
+                        dfh = dfh.sort_values('Date')
                         
-                        bench_name = st.selectbox("選擇比較標的", list(BENCHMARKS.keys()))
-                        bench_ticker = BENCHMARKS[bench_name]
-                        
-                        if not dfh.empty:
-                            start_date = dfh.index.min() # 這是一個 date 物件
-                            
-                            # 2. 抓取標的資料 (已強制轉為 date index)
-                            bench_df = get_benchmark_history(bench_ticker, start_date)
-
-                            if bench_df is not None and not bench_df.empty:
-                                # 3. 合併 (現在 index 都是 date 物件，絕對能對齊)
-                                merged = pd.merge(dfh, bench_df, left_index=True, right_index=True, how='left')
-                                merged['Close'] = merged['Close'].ffill()
-                                
-                                # 移除空值 (如假日)
-                                merged = merged.dropna()
-                                
-                                if not merged.empty:
-                                    first_asset = merged['NetAsset'].iloc[0]
-                                    first_bench = merged['Close'].iloc[0]
-                                    
-                                    merged['User_Growth'] = (merged['NetAsset'] / first_asset - 1) * 100
-                                    merged['Bench_Growth'] = (merged['Close'] / first_bench - 1) * 100
-                                    
-                                    fig = go.Figure()
-                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的資產 ({username})', line=dict(width=3, color='#d62728')))
-                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name} (趨勢)', line=dict(width=2, color='gray', dash='dot')))
-                                    fig.update_layout(title=f"資產成長 vs {bench_name}", xaxis_title="日期", yaxis_title="累計報酬率 (%)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                                    st.plotly_chart(fig, use_container_width=True)
-                                else: st.warning("⚠️ 日期對齊後無資料，請確認 Google Sheets 歷史資料的日期範圍。")
-                            else: st.warning(f"無法取得 {bench_name} 歷史資料")
-                        else: st.info("尚無歷史資料")
-                    else: st.info("💡 歷史資料不足，請手動至 Google Sheets 補上至少一筆過去日期的資料。")
+                        fig = px.line(dfh, x='Date', y='NetAsset', markers=True, title=f"淨資產走勢 ({username})")
+                        fig.update_traces(line_color='#1f77b4', line_width=3)
+                        fig.update_layout(xaxis_title="日期", yaxis_title="淨資產 (TWD)", hovermode="x unified")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else: st.info("歷史資料不足 (尚未累積數據)")
             else: st.error("無法讀取歷史")
 
         with tab4:
