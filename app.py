@@ -10,7 +10,7 @@ import plotly.express as px
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家", layout="wide", page_icon="📈")
 
-# --- 股票代碼與名稱對照表 ---
+# --- 股票代碼與名稱對照表 (可自行擴充) ---
 STOCK_MAP = {
     '2330.TW': '台積電', '2317.TW': '鴻海', '2454.TW': '聯發科',
     '2603.TW': '長榮', '2609.TW': '陽明', '2615.TW': '萬海',
@@ -26,6 +26,7 @@ def get_google_client():
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         secret_str = st.secrets["service_account_info"]
         creds_dict = None
+        # 自動修復 Secrets 格式問題
         try:
             creds_dict = json.loads(secret_str, strict=False)
         except json.JSONDecodeError:
@@ -75,6 +76,7 @@ def load_data(sheet):
             if 'h' not in data: data['h'] = {}
             if 'cash' not in data: data['cash'] = 0.0
             if 'history' not in data: data['history'] = []
+            # 資料結構防呆補全
             for code in data.get('h', {}):
                 if 'lots' not in data['h'][code]:
                     data['h'][code]['lots'] = [{
@@ -106,6 +108,7 @@ def record_history(client, username, net_asset):
 def get_price_data(ticker):
     try:
         stock = yf.Ticker(ticker)
+        # 嘗試抓取兩天資料以計算漲跌
         hist = stock.history(period='2d')
         if len(hist) >= 1:
             price = hist['Close'].iloc[-1]
@@ -114,6 +117,7 @@ def get_price_data(ticker):
             change_pct = (change_val / prev_close * 100) if prev_close else 0
             return price, change_val, change_pct
         
+        # 備援方案：Fast Info
         price = stock.fast_info.get('last_price')
         if price and not pd.isna(price):
              prev = stock.info.get('previousClose', price)
@@ -137,6 +141,7 @@ if 'current_user' not in st.session_state:
 
 if not st.session_state.current_user:
     st.markdown("<h1 style='text-align: center;'>🔐 股票資產管家</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>請輸入使用者名稱以登入或建立新帳戶</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
         user_input = st.text_input("使用者名稱 (例如: Kevin)", key="login_input")
@@ -147,7 +152,7 @@ if not st.session_state.current_user:
             else: st.error("請輸入名稱")
     st.stop()
 
-# --- 主程式 ---
+# --- 主程式 (已登入) ---
 username = st.session_state.current_user
 
 with st.sidebar:
@@ -177,7 +182,7 @@ if not sheet:
 
 st.title(f"📈 資產管家 - {username}")
 
-# --- 側邊欄：完整功能區 ---
+# --- 側邊欄：完整交易功能 ---
 with st.sidebar:
     # 1. 資金管理
     st.header("💰 資金與交易")
@@ -268,6 +273,7 @@ with st.sidebar:
                         else: new_lots.append(lot)
                     
                     realized_profit = sell_revenue - total_cost_basis
+                    # 已實現 ROI 也可考慮本金 (這裡暫用總成本，因已實現通常只看總賺多少)
                     realized_roi = (realized_profit / total_cost_basis * 100) if total_cost_basis else 0
                     cash_back = sell_revenue - total_debt_repaid
                     data['cash'] += cash_back
@@ -314,7 +320,7 @@ with st.sidebar:
         else: st.info("無資料可刪除")
 
 
-# --- 主畫面 ---
+# --- 主畫面更新與計算 ---
 if st.button("🔄 更新即時報價與走勢", type="primary", use_container_width=True):
     with st.spinner('正在連線交易所抓取最新數據...'):
         usdtwd = get_usdtwd()
@@ -325,10 +331,13 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         total_cost_val = 0.0
         total_debt = 0.0
         total_day_profit = 0.0
+        
+        # 為了計算加權平均的槓桿 ROI
+        agg_profit_for_roi = 0.0
+        agg_principal_for_roi = 0.0
 
-       for code, info in h.items():
+        for code, info in h.items():
             cur_p, change_val, change_pct = get_price_data(code)
-            # 防呆：如果抓不到價格，就用成本價，避免崩潰
             if cur_p is None or pd.isna(cur_p): cur_p = info['c']
             
             rate = 1.0 if ('.TW' in code or '.TWO' in code) else usdtwd
@@ -336,61 +345,45 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             c_val = float(info['c'])
             p_val = float(cur_p)
             
-            # 1. 基礎數值計算
-            mkt_val = p_val * s_val * rate          # 目前市值
-            cost_val = c_val * s_val * rate         # 總成本 (含借款)
-            
-            # 2. 計算該股票的總融資負債
+            # 市值、總成本、負債
+            mkt_val = p_val * s_val * rate
+            cost_val = c_val * s_val * rate
             stock_debt = sum(l.get('debt', 0) for l in info.get('lots', []))
             
-            # 3. 計算損益金額 (市值 - 總成本)
-            # 註：融資獲利的絕對金額跟現股一樣，都是股價差額
-            total_profit_val = mkt_val - cost_val
-            
-            # 4. 【關鍵修改】計算真實投入本金 (總成本 - 負債)
+            # --- 關鍵：計算真實投入本金 ---
             actual_principal = cost_val - stock_debt
             
-            # 5. 【關鍵修改】計算槓桿報酬率 (損益 / 本金)
+            # 損益金額 (市值 - 成本)
+            total_profit_val = mkt_val - cost_val
+            
+            # --- 關鍵：槓桿報酬率 (損益 / 本金) ---
             if actual_principal > 0:
                 total_profit_pct = (total_profit_val / actual_principal * 100)
             else:
-                total_profit_pct = 0
+                total_profit_pct = 0 # 避免除以零
             
-            # 日損益
+            # 累加數據
             day_profit_val = change_val * s_val * rate
             total_day_profit += day_profit_val
             
-            # 累加總數
             total_mkt_val += mkt_val
             total_cost_val += cost_val
             total_debt += stock_debt
+            
+            agg_profit_for_roi += total_profit_val
+            agg_principal_for_roi += actual_principal
 
             name = STOCK_MAP.get(code, code)
-            
-            # 判斷是否使用槓桿 (顯示用途)
-            leverage_tag = ""
-            if stock_debt > 0:
-                # 簡單計算槓桿倍數
-                lev = cost_val / actual_principal if actual_principal else 0
-                leverage_tag = f"(x{lev:.1f})"
-
             temp_list.append({
-                "raw_code": code, 
-                "股票代碼": code, 
-                "公司名稱": name,
-                "股數": int(s_val), 
-                "成本": c_val, 
-                "現價": p_val,
-                "日損益%": change_pct / 100, 
-                "日損益": day_profit_val,
-                "總損益%": total_profit_pct / 100, # 這裡現在是真實本金報酬率
+                "raw_code": code, "股票代碼": code, "公司名稱": name,
+                "股數": int(s_val), "成本": c_val, "現價": p_val,
+                "日損益%": change_pct / 100, "日損益": day_profit_val,
+                "總損益%": total_profit_pct / 100, # 這裡已是槓桿後 ROI
                 "總損益": total_profit_val,
-                "市值": mkt_val, 
-                "mkt_val_raw": mkt_val,
-                "槓桿": leverage_tag # 隱藏欄位，可自行決定是否顯示
-            })
+                "市值": mkt_val, "mkt_val_raw": mkt_val
             })
 
+        # 計算占比
         final_rows = []
         for item in temp_list:
             weight = (item['mkt_val_raw'] / total_mkt_val) if total_mkt_val > 0 else 0
@@ -401,26 +394,34 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         unrealized_profit = total_mkt_val - total_cost_val
         if client: record_history(client, username, net_asset)
 
-        # 計算已實現損益
+        # 已實現損益
         total_realized_profit = 0
         total_realized_cost = 0
         for r in data.get('history', []):
             total_realized_profit += r.get('profit', 0)
             total_realized_cost += r.get('buy_cost', 0)
 
-        # --- 計算整體 ROI ---
-        total_unrealized_roi = (unrealized_profit / total_cost_val * 100) if total_cost_val > 0 else 0
+        # --- KPI 計算 (含百分比) ---
+        # 1. 未實現 ROI (基於本金)
+        if agg_principal_for_roi > 0:
+            total_unrealized_roi = (agg_profit_for_roi / agg_principal_for_roi * 100)
+        else:
+            total_unrealized_roi = 0
+            
+        # 2. 今日 ROI (今日損益 / 昨日市值)
         yesterday_mkt_val = total_mkt_val - total_day_profit
         total_day_roi = (total_day_profit / yesterday_mkt_val * 100) if yesterday_mkt_val > 0 else 0
+        
+        # 3. 已實現 ROI (基於總成本，因為歷史紀錄未詳細拆分本金/負債)
         total_realized_roi = (total_realized_profit / total_realized_cost * 100) if total_realized_cost > 0 else 0
 
-        # 計算「總合損益」 (未實現 + 已實現)
+        # 4. 總合損益 (未實現 + 已實現)
         grand_total_profit = unrealized_profit + total_realized_profit
-        grand_total_cost = total_cost_val + total_realized_cost
-        grand_total_roi = (grand_total_profit / grand_total_cost * 100) if grand_total_cost > 0 else 0
+        # 簡單估算總本金 = 目前投入本金 + 已實現部位成本
+        grand_total_principal = agg_principal_for_roi + total_realized_cost
+        grand_total_roi = (grand_total_profit / grand_total_principal * 100) if grand_total_principal > 0 else 0
 
-        # KPI 版面配置 (兩列式)
-        # 第一列：資產概況
+        # --- 版面顯示 ---
         st.subheader("🏦 資產概況")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("💰 淨資產", f"${int(net_asset):,}")
@@ -430,15 +431,11 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         
         st.markdown("---")
         
-        # 第二列：損益績效
         st.subheader("📈 績效表現")
         kp1, kp2, kp3, kp4 = st.columns(4)
-        
-        kp1.metric("📅 今日損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
-        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}%")
+        kp1.metric("📅 今日總損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
+        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}% (槓桿)")
         kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
-        
-        # 總合損益 (顯示整體戰果)
         kp4.metric("🏆 總合損益", f"${int(grand_total_profit):+,}", delta=f"{grand_total_roi:+.2f}%")
 
         tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 走勢圖", "📜 已實現損益"])
