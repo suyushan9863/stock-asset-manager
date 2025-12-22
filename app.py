@@ -273,3 +273,261 @@ with st.sidebar:
                     sell_revenue = sell_qty * sell_price * rate
                     remain_to_sell = sell_qty
                     total_cost_basis = 0
+                    total_debt_repaid = 0
+                    new_lots = []
+                    for lot in lots:
+                        if remain_to_sell > 0:
+                            take_qty = min(lot['s'], remain_to_sell)
+                            lot_cost = take_qty * lot['p'] * rate
+                            lot_debt = lot.get('debt', 0) * (take_qty / lot['s']) if lot['s'] > 0 else 0
+                            total_cost_basis += lot_cost
+                            total_debt_repaid += lot_debt
+                            lot['s'] -= take_qty
+                            lot['debt'] -= lot_debt
+                            remain_to_sell -= take_qty
+                            if lot['s'] > 0: new_lots.append(lot)
+                        else: new_lots.append(lot)
+                    
+                    realized_profit = sell_revenue - total_cost_basis
+                    realized_roi = (realized_profit / total_cost_basis * 100) if total_cost_basis else 0
+                    cash_back = sell_revenue - total_debt_repaid
+                    data['cash'] += cash_back
+                    
+                    if new_lots:
+                        data['h'][sell_code]['lots'] = new_lots
+                        data['h'][sell_code]['s'] -= sell_qty
+                        ts = sum(l['s'] for l in new_lots)
+                        tc = sum(l['s']*l['p'] for l in new_lots)
+                        data['h'][sell_code]['c'] = tc / ts if ts else 0
+                    else: del data['h'][sell_code]
+                    
+                    if 'history' not in data: data['history'] = []
+                    data['history'].append({
+                        'd': datetime.now().strftime('%Y-%m-%d'), 'code': sell_code,
+                        'name': STOCK_MAP.get(sell_code, sell_code), 'qty': sell_qty,
+                        'buy_cost': total_cost_basis, 'sell_rev': sell_revenue,
+                        'profit': realized_profit, 'roi': realized_roi
+                    })
+                    save_data(sheet, data)
+                    st.success(f"賣出成功"); st.balloons(); st.rerun()
+
+    st.markdown("---")
+
+    with st.expander("🔧 庫存修正/刪除"):
+        st.warning("⚠️ 僅用於輸入錯誤修正，會退回自備款。")
+        del_list = list(data.get('h', {}).keys())
+        if del_list:
+            to_del_code = st.selectbox("刪除代碼", ["請選擇"] + del_list, key="force_del_select")
+            if to_del_code != "請選擇":
+                if st.button(f"強制刪除 {to_del_code}"):
+                    t_back = 0
+                    is_tw = ('.TW' in to_del_code or '.TWO' in to_del_code)
+                    rate = 1.0 if is_tw else get_usdtwd()
+                    for l in data['h'][to_del_code].get('lots', []):
+                        cost_t = l['p'] * l['s'] * rate
+                        debt = l.get('debt', 0)
+                        t_back += (cost_t - debt)
+                    data['cash'] += t_back
+                    del data['h'][to_del_code]
+                    save_data(sheet, data)
+                    st.success(f"已刪除 {to_del_code}"); st.rerun()
+        else: st.info("無資料")
+
+
+# --- 主畫面更新 ---
+if st.button("🔄 更新即時報價與走勢", type="primary", use_container_width=True):
+    with st.spinner('正在連線交易所抓取最新數據...'):
+        usdtwd = get_usdtwd()
+        h = data.get('h', {})
+        
+        temp_list = []
+        total_mkt_val = 0.0
+        total_cost_val = 0.0
+        total_debt = 0.0
+        total_day_profit = 0.0
+        agg_profit_for_roi = 0.0
+        agg_principal_for_roi = 0.0
+
+        for code, info in h.items():
+            cur_p, change_val, change_pct = get_price_data(code)
+            if cur_p is None or pd.isna(cur_p): cur_p = info['c']
+            
+            rate = 1.0 if ('.TW' in code or '.TWO' in code) else usdtwd
+            s_val = float(info['s'])
+            c_val = float(info['c'])
+            p_val = float(cur_p)
+            
+            mkt_val = p_val * s_val * rate
+            cost_val = c_val * s_val * rate
+            stock_debt = sum(l.get('debt', 0) for l in info.get('lots', []))
+            actual_principal = cost_val - stock_debt
+            
+            total_profit_val = mkt_val - cost_val
+            total_profit_pct = (total_profit_val / actual_principal * 100) if actual_principal > 0 else 0
+            
+            day_profit_val = change_val * s_val * rate
+            total_day_profit += day_profit_val
+            
+            total_mkt_val += mkt_val
+            total_cost_val += cost_val
+            total_debt += stock_debt
+            agg_profit_for_roi += total_profit_val
+            agg_principal_for_roi += actual_principal
+
+            name = STOCK_MAP.get(code, code)
+            temp_list.append({
+                "raw_code": code, "股票代碼": code, "公司名稱": name,
+                "股數": int(s_val), "成本": c_val, "現價": p_val,
+                "日損益%": change_pct / 100, "日損益": day_profit_val,
+                "總損益%": total_profit_pct / 100, "總損益": total_profit_val,
+                "市值": mkt_val, "mkt_val_raw": mkt_val
+            })
+
+        final_rows = []
+        for item in temp_list:
+            weight = (item['mkt_val_raw'] / total_mkt_val) if total_mkt_val > 0 else 0
+            item["占比"] = weight
+            final_rows.append(item)
+
+        net_asset = (total_mkt_val + data['cash']) - total_debt
+        unrealized_profit = total_mkt_val - total_cost_val
+        if client: record_history(client, username, net_asset)
+
+        total_realized_profit = 0
+        total_realized_cost = 0
+        for r in data.get('history', []):
+            total_realized_profit += r.get('profit', 0)
+            total_realized_cost += r.get('buy_cost', 0)
+
+        # KPI
+        total_unrealized_roi = (agg_profit_for_roi / agg_principal_for_roi * 100) if agg_principal_for_roi > 0 else 0
+        yesterday_mkt_val = total_mkt_val - total_day_profit
+        total_day_roi = (total_day_profit / yesterday_mkt_val * 100) if yesterday_mkt_val > 0 else 0
+        total_realized_roi = (total_realized_profit / total_realized_cost * 100) if total_realized_cost > 0 else 0
+        grand_total_profit = unrealized_profit + total_realized_profit
+        grand_total_principal = agg_principal_for_roi + total_realized_cost
+        grand_total_roi = (grand_total_profit / grand_total_principal * 100) if grand_total_principal > 0 else 0
+
+        st.subheader("🏦 資產概況")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("💰 淨資產", f"${int(net_asset):,}")
+        k2.metric("💵 現金餘額", f"${int(data.get('cash', 0)):,}")
+        k3.metric("📊 證券市值", f"${int(total_mkt_val):,}")
+        k4.metric("💸 融資負債", f"${int(total_debt):,}", delta_color="inverse")
+        st.markdown("---")
+        st.subheader("📈 績效表現")
+        kp1, kp2, kp3, kp4 = st.columns(4)
+        kp1.metric("📅 今日損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
+        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}% (槓桿)")
+        kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
+        kp4.metric("🏆 總合損益", f"${int(grand_total_profit):+,}", delta=f"{grand_total_roi:+.2f}%")
+
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 成長比例走勢", "📜 已實現損益"])
+        def color_profit(val):
+            color = 'red' if val > 0 else 'green' if val < 0 else 'black'
+            return f'color: {color}'
+
+        with tab1:
+            if final_rows:
+                df = pd.DataFrame(final_rows)
+                cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
+                df = df[cols]
+                styler = df.style.format({
+                    '股數': '{:,}', '成本': '{:,.2f}', '現價': '{:,.2f}',
+                    '日損益%': '{:+.2%}', '日損益': '{:+,.0f}',
+                    '總損益%': '{:+.2%}', '總損益': '{:+,.0f}',
+                    '市值': '{:,.0f}', '占比': '{:.1%}'
+                }).map(color_profit, subset=['日損益%', '日損益', '總損益%', '總損益'])
+                st.dataframe(styler, use_container_width=True, height=500, hide_index=True)
+            else: st.info("無庫存資料")
+
+        with tab2:
+            if temp_list:
+                df_tree = pd.DataFrame(temp_list)
+                fig_tree = px.treemap(
+                    df_tree, path=['股票代碼'], values='mkt_val_raw', color='日損益%',
+                    color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
+                    custom_data=['公司名稱', '日損益%']
+                )
+                fig_tree.update_traces(texttemplate="%{label}<br>%{customdata[0]}<br>%{customdata[1]:+.2%}", textposition="middle center")
+                st.plotly_chart(fig_tree, use_container_width=True)
+            else: st.info("無數據")
+
+        with tab3:
+            st.caption("ℹ️ 此圖表顯示「累計報酬率 (%)」，起點設為 0%。這能更公平地比較投資組合與大盤的成長趨勢，並減少因入金/出金造成的線圖斷層影響。")
+            if client:
+                hs = get_user_history_sheet(client, username)
+                if hs:
+                    hvals = hs.get_all_values()
+                    if len(hvals) > 1:
+                        # 1. 整理使用者資料
+                        dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
+                        dfh['Date'] = pd.to_datetime(dfh['Date'])
+                        dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
+                        dfh = dfh.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+                        dfh = dfh.set_index('Date')
+                        
+                        # 2. 選擇比較標的
+                        bench_name = st.selectbox("選擇比較標的", list(BENCHMARKS.keys()))
+                        bench_ticker = BENCHMARKS[bench_name]
+                        
+                        if not dfh.empty:
+                            start_date = dfh.index.min()
+                            end_date = datetime.now() # 確保抓到最新
+                            
+                            # 3. 抓取標的資料
+                            bench_df = get_benchmark_history(bench_ticker, start_date, end_date)
+                            
+                            if bench_df is not None and not bench_df.empty:
+                                # 4. 合併資料 (對齊日期)
+                                merged = pd.merge(dfh, bench_df, left_index=True, right_index=True, how='left')
+                                merged['Close'] = merged['Close'].ffill() # 補齊假日數據
+                                
+                                # 5. 計算累計成長率 (歸一化：(當日/第一天 - 1) * 100)
+                                first_asset = merged['NetAsset'].iloc[0]
+                                first_bench = merged['Close'].iloc[0]
+                                
+                                if first_asset > 0 and first_bench > 0:
+                                    merged['User_Growth'] = (merged['NetAsset'] / first_asset - 1) * 100
+                                    merged['Bench_Growth'] = (merged['Close'] / first_bench - 1) * 100
+                                    
+                                    # 6. 繪圖
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的投資組合 ({username})', line=dict(width=3, color='#1f77b4')))
+                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name} ({bench_ticker})', line=dict(width=2, color='gray', dash='dot')))
+                                    
+                                    fig.update_layout(
+                                        title=f"資產成長 vs {bench_name}",
+                                        xaxis_title="日期",
+                                        yaxis_title="累計報酬率 (%)",
+                                        hovermode="x unified",
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                                else:
+                                    st.warning("起始資料為 0，無法計算成長率")
+                            else:
+                                st.warning(f"無法取得 {bench_name} 的歷史資料")
+                        else:
+                            st.info("尚無歷史資料")
+                    else: st.info("累積資料不足 (至少需要兩天)")
+            else: st.error("無法讀取歷史")
+
+        with tab4:
+            history = data.get('history', [])
+            if history:
+                df_hist = pd.DataFrame(history[::-1])
+                st.subheader(f"累計已實現損益: ${int(total_realized_profit):+,}")
+                if not df_hist.empty:
+                    df_hist = df_hist[['d', 'code', 'name', 'qty', 'buy_cost', 'sell_rev', 'profit', 'roi']]
+                    df_hist.columns = ['日期', '代碼', '名稱', '賣出股數', '總成本', '賣出收入', '獲利金額', '報酬率%']
+                    df_hist['報酬率%'] = df_hist['報酬率%'] / 100
+                    styler_h = df_hist.style.format({
+                        '賣出股數': '{:,}', '總成本': '{:,.0f}', '賣出收入': '{:,.0f}',
+                        '獲利金額': '{:+,.0f}', '報酬率%': '{:+.2%}'
+                    }).map(color_profit, subset=['獲利金額', '報酬率%'])
+                    st.dataframe(styler_h, use_container_width=True, hide_index=True)
+            else: st.info("尚無賣出紀錄")
+
+else:
+    st.info("👆 請點擊上方按鈕更新")
