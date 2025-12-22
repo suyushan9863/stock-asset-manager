@@ -21,14 +21,13 @@ STOCK_MAP = {
     'MSFT': '微軟', 'GOOG': '谷歌', 'AMZN': '亞馬遜'
 }
 
-# --- 比較標的清單 (新增) ---
+# --- 比較標的清單 ---
 BENCHMARKS = {
     '台灣加權指數': '^TWII',
     '0050 (元大台灣50)': '0050.TW',
     'S&P 500 (美股大盤)': '^GSPC',
     'QQQ (那斯達克100)': 'QQQ',
-    '費城半導體指數': '^SOX',
-    '台指期 (近月)': 'WTX-PERP.TW' # 若抓不到可視情況調整
+    '費城半導體指數': '^SOX'
 }
 
 # --- Google Sheets 連線與資料處理 ---
@@ -142,17 +141,36 @@ def get_usdtwd():
         return p if p and not pd.isna(p) else 32.5
     except: return 32.5
 
-# --- 新增：取得歷史區間的標的走勢 (用於繪圖) ---
-@st.cache_data(ttl=3600) # 快取1小時
+# --- 新增：取得歷史區間的標的走勢 (強固版) ---
+@st.cache_data(ttl=3600)
 def get_benchmark_history(ticker, start_date, end_date):
     try:
-        data = yf.download(ticker, start=start_date, end=end_date)
+        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
         if not data.empty:
-            # 只留 Close，並正規化 Index
-            df = data[['Close']].copy()
-            df.index = df.index.tz_localize(None) # 移除時區以便對齊
+            # 處理 MultiIndex (yfinance 新版特性)
+            if isinstance(data.columns, pd.MultiIndex):
+                try:
+                    df = data.xs('Close', level=0, axis=1)
+                except:
+                    df = data['Close'] # 備用方案
+            else:
+                df = data[['Close']]
+            
+            # 確保是 DataFrame 且只有一欄
+            if isinstance(df, pd.Series):
+                df = df.to_frame(name='Close')
+            else:
+                df = df[['Close']]
+                
+            # 關鍵修正：移除時區並標準化
+            df.index = pd.to_datetime(df.index).normalize()
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+                
             return df
-    except: pass
+    except Exception as e: 
+        print(f"Benchmark Error: {e}")
+        pass
     return None
 
 # --- 登入介面 ---
@@ -399,7 +417,6 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             total_realized_profit += r.get('profit', 0)
             total_realized_cost += r.get('buy_cost', 0)
 
-        # KPI
         total_unrealized_roi = (agg_profit_for_roi / agg_principal_for_roi * 100) if agg_principal_for_roi > 0 else 0
         yesterday_mkt_val = total_mkt_val - total_day_profit
         total_day_roi = (total_day_profit / yesterday_mkt_val * 100) if yesterday_mkt_val > 0 else 0
@@ -454,63 +471,52 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             else: st.info("無數據")
 
         with tab3:
-            st.caption("ℹ️ 此圖表顯示「累計報酬率 (%)」，起點設為 0%。這能更公平地比較投資組合與大盤的成長趨勢，並減少因入金/出金造成的線圖斷層影響。")
+            st.caption("ℹ️ 此圖表顯示「累計報酬率 (%)」，起點設為 0%。需累積至少兩天資料才會顯示。")
             if client:
                 hs = get_user_history_sheet(client, username)
                 if hs:
                     hvals = hs.get_all_values()
                     if len(hvals) > 1:
-                        # 1. 整理使用者資料
                         dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
-                        dfh['Date'] = pd.to_datetime(dfh['Date'])
+                        # 關鍵修正：處理日期格式
+                        dfh['Date'] = pd.to_datetime(dfh['Date']).dt.normalize()
                         dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
                         dfh = dfh.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
                         dfh = dfh.set_index('Date')
+                        # 確保使用者資料的 Index 是 Naive TimeZone
+                        if dfh.index.tz is not None:
+                            dfh.index = dfh.index.tz_localize(None)
                         
-                        # 2. 選擇比較標的
                         bench_name = st.selectbox("選擇比較標的", list(BENCHMARKS.keys()))
                         bench_ticker = BENCHMARKS[bench_name]
                         
                         if not dfh.empty:
                             start_date = dfh.index.min()
-                            end_date = datetime.now() # 確保抓到最新
+                            end_date = datetime.now()
                             
-                            # 3. 抓取標的資料
                             bench_df = get_benchmark_history(bench_ticker, start_date, end_date)
-                            
+
                             if bench_df is not None and not bench_df.empty:
-                                # 4. 合併資料 (對齊日期)
+                                # 合併時自動對齊 Index
                                 merged = pd.merge(dfh, bench_df, left_index=True, right_index=True, how='left')
-                                merged['Close'] = merged['Close'].ffill() # 補齊假日數據
+                                merged['Close'] = merged['Close'].ffill()
                                 
-                                # 5. 計算累計成長率 (歸一化：(當日/第一天 - 1) * 100)
                                 first_asset = merged['NetAsset'].iloc[0]
                                 first_bench = merged['Close'].iloc[0]
                                 
-                                if first_asset > 0 and first_bench > 0:
+                                if first_asset > 0 and first_bench > 0 and not pd.isna(first_bench):
                                     merged['User_Growth'] = (merged['NetAsset'] / first_asset - 1) * 100
                                     merged['Bench_Growth'] = (merged['Close'] / first_bench - 1) * 100
                                     
-                                    # 6. 繪圖
                                     fig = go.Figure()
-                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的投資組合 ({username})', line=dict(width=3, color='#1f77b4')))
-                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name} ({bench_ticker})', line=dict(width=2, color='gray', dash='dot')))
-                                    
-                                    fig.update_layout(
-                                        title=f"資產成長 vs {bench_name}",
-                                        xaxis_title="日期",
-                                        yaxis_title="累計報酬率 (%)",
-                                        hovermode="x unified",
-                                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                                    )
+                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的資產 ({username})', line=dict(width=3, color='#d62728')))
+                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name}', line=dict(width=2, color='gray', dash='dot')))
+                                    fig.update_layout(title=f"資產成長 vs {bench_name}", xaxis_title="日期", yaxis_title="累計報酬率 (%)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                                     st.plotly_chart(fig, use_container_width=True)
-                                else:
-                                    st.warning("起始資料為 0，無法計算成長率")
-                            else:
-                                st.warning(f"無法取得 {bench_name} 的歷史資料")
-                        else:
-                            st.info("尚無歷史資料")
-                    else: st.info("累積資料不足 (至少需要兩天)")
+                                else: st.warning("⚠️ 無法繪圖：起始日大盤資料缺失，請嘗試手動補齊昨日資料。")
+                            else: st.warning(f"無法取得 {bench_name} 歷史資料")
+                        else: st.info("尚無歷史資料")
+                    else: st.info("💡 這是新版程式，歷史資料已重置。請每天按一次更新，兩天後就會出現走勢圖。")
             else: st.error("無法讀取歷史")
 
         with tab4:
