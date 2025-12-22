@@ -499,7 +499,8 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
             else: st.info("無數據")
 
         with tab3:
-            st.caption("ℹ️ 圖表比較：您的「淨資產報酬率」vs 大盤 (已排除入金影響)")
+            st.caption("ℹ️ 資產走勢分析：可切換查看「獲利金額」或「報酬率」 (已排除入金造成的資產虛增)")
+            
             if client:
                 hs = get_user_history_sheet(client, username)
                 if hs:
@@ -507,48 +508,75 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
                     if len(hvals) > 1:
                         headers = hvals[0]
                         dfh = pd.DataFrame(hvals[1:], columns=headers)
+                        
                         dfh['Date'] = pd.to_datetime(dfh['Date'])
-                        dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
+                        dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'], errors='coerce').fillna(0)
                         
                         if 'Principal' in dfh.columns:
-                            dfh['Principal'] = pd.to_numeric(dfh['Principal'])
+                            dfh['Principal'] = pd.to_numeric(dfh['Principal'], errors='coerce').fillna(0)
                         else:
                             dfh['Principal'] = dfh['NetAsset'] 
 
+                        # 避免本金為 0
+                        dfh['Principal'] = dfh.apply(lambda x: x['NetAsset'] if x['Principal'] == 0 else x['Principal'], axis=1)
                         dfh = dfh.sort_values('Date')
-                        dfh['Principal'] = dfh['Principal'].replace(0, 1)
-                        dfh['ROI'] = (dfh['NetAsset'] - dfh['Principal']) / dfh['Principal'] * 100
-                        
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=dfh['Date'], y=dfh['ROI'],
-                            mode='lines+markers', name='我的投資組合',
-                            line=dict(color='#d62728', width=3),
-                            hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<extra></extra>'
-                        ))
 
-                        if not dfh.empty:
-                            start_date = dfh['Date'].min().strftime('%Y-%m-%d')
-                            benchmarks = get_benchmark_data(start_date)
-                            colors = {'0050.TW': 'blue', 'SPY': 'green', 'QQQ': 'purple'}
-                            for name, series in benchmarks.items():
-                                aligned_series = series[series.index >= dfh['Date'].min()]
-                                fig.add_trace(go.Scatter(
-                                    x=aligned_series.index, y=aligned_series.values,
-                                    mode='lines', name=name,
-                                    line=dict(color=colors.get(name, 'gray'), width=1, dash='dot'),
-                                    hovertemplate=f'<b>{name}</b>: %{{y:.2f}}%<extra></extra>'
-                                ))
+                        # [核心公式] 損益 = 淨資產 - 本金
+                        dfh['Profit_Val'] = dfh['NetAsset'] - dfh['Principal']
+                        dfh['ROI_Pct'] = (dfh['Profit_Val'] / dfh['Principal']) * 100
+                        
+                        view_type = st.radio("顯示模式", ["💰 總損益金額 (TWD)", "📈 累計報酬率 (%)"], horizontal=True)
+
+                        fig = go.Figure()
+
+                        if view_type == "💰 總損益金額 (TWD)":
+                            fig.add_trace(go.Scatter(
+                                x=dfh['Date'], y=dfh['Profit_Val'],
+                                mode='lines+markers', name='總損益金額',
+                                line=dict(color='#d62728', width=3),
+                                fill='tozeroy', 
+                                fillcolor='rgba(214, 39, 40, 0.1)',
+                                hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>損益</b>: $%{y:,.0f}<extra></extra>'
+                            ))
+                            yaxis_format = ",.0f"
+                            y_title = "損益金額 (TWD)"
+                            
+                        else:
+                            fig.add_trace(go.Scatter(
+                                x=dfh['Date'], y=dfh['ROI_Pct'],
+                                mode='lines+markers', name='我的報酬率',
+                                line=dict(color='#d62728', width=3),
+                                hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<extra></extra>'
+                            ))
+
+                            if not dfh.empty:
+                                start_date = dfh['Date'].min().strftime('%Y-%m-%d')
+                                benchmarks = get_benchmark_data(start_date)
+                                colors = {'0050.TW': 'blue', 'SPY': 'green', 'QQQ': 'purple'}
+                                for name, series in benchmarks.items():
+                                    aligned_series = series[series.index >= dfh['Date'].min()]
+                                    fig.add_trace(go.Scatter(
+                                        x=aligned_series.index, y=aligned_series.values,
+                                        mode='lines', name=name,
+                                        line=dict(color=colors.get(name, 'gray'), width=1, dash='dot'),
+                                        hovertemplate=f'<b>{name}</b>: %{{y:.2f}}%<extra></extra>'
+                                    ))
+                            yaxis_format = ".2f"
+                            y_title = "累計報酬率 (%)"
 
                         fig.update_layout(
-                            xaxis_title="日期", yaxis_title="累計報酬率 (%)",
+                            xaxis_title="日期", 
+                            yaxis_title=y_title,
                             hovermode="x unified",
-                            yaxis=dict(tickformat=".2f", ticksuffix="%"),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                            yaxis=dict(tickformat=yaxis_format),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            height=500
                         )
                         st.plotly_chart(fig, use_container_width=True)
-                    else: st.info("尚無歷史資料")
-            else: st.error("無法讀取歷史")
+                    else:
+                        st.info("尚無歷史資料，請先執行一次「更新即時報價」。")
+            else:
+                st.error("無法讀取歷史資料 (Client Error)")
 
         with tab4:
             history = data.get('history', [])
