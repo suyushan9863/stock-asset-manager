@@ -26,13 +26,11 @@ STOCK_MAP = {
 def get_google_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        # 嘗試讀取 secrets，相容字串或字典格式
         secret_info = st.secrets["service_account_info"]
         if isinstance(secret_info, str):
             creds_dict = json.loads(secret_info, strict=False)
         else:
             creds_dict = secret_info
-            
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client
@@ -62,7 +60,6 @@ def get_user_history_sheet(client, username):
         try:
             history_sheet = spreadsheet.worksheet(worksheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            # 建立包含本金欄位的新表
             history_sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols="3")
             history_sheet.append_row(['Date', 'NetAsset', 'Principal'])
         return history_sheet
@@ -78,7 +75,6 @@ def load_data(sheet):
             if 'h' not in data: data['h'] = {}
             if 'cash' not in data: data['cash'] = 0.0
             if 'history' not in data: data['history'] = []
-            # 初始化本金 (若舊資料無此欄位)
             if 'principal' not in data: data['principal'] = data.get('cash', 0.0)
             
             # 資料清洗
@@ -104,7 +100,6 @@ def record_history(client, username, net_asset, current_principal):
         today = datetime.now().strftime('%Y-%m-%d')
         try:
             all_values = hist_sheet.get_all_values()
-            # 補齊標題列
             if len(all_values) > 0 and len(all_values[0]) < 3:
                  hist_sheet.update_cell(1, 3, 'Principal')
 
@@ -226,6 +221,7 @@ with st.sidebar:
         st.session_state.current_user = None
         if 'data' in st.session_state: del st.session_state.data
         if 'sheet' in st.session_state: del st.session_state.sheet
+        if 'dashboard_data' in st.session_state: del st.session_state.dashboard_data
         st.rerun()
     st.markdown("---")
 
@@ -247,12 +243,11 @@ if not sheet:
 
 st.title(f"📈 資產管家 - {username}")
 
-# --- 側邊欄：資金與下單 (含本金校正) ---
+# --- 側邊欄：資金與下單 ---
 with st.sidebar:
     st.header("💰 資金與交易")
     st.metric("現金餘額", f"${int(data.get('cash', 0)):,}")
     
-    # [新增] 本金校正區塊
     with st.expander("⚙️ 系統設定 / 本金校正"):
         st.info("若報酬率計算異常(水平線)，請點擊下方按鈕。")
         if st.button("🔄 自動校正本金"):
@@ -388,7 +383,12 @@ with st.sidebar:
                 save_data(sheet, data)
                 st.rerun()
 
-# --- 主畫面更新 ---
+# --- 資料更新按鈕 ---
+# 初始化 session state 中的 dashboard_data
+if 'dashboard_data' not in st.session_state:
+    st.session_state.dashboard_data = None
+
+# 按鈕只負責「計算並存入 State」
 if st.button("🔄 更新即時報價 (極速版)", type="primary", use_container_width=True):
     with st.spinner('正在同步市場數據...'):
         usdtwd = get_usdtwd()
@@ -452,147 +452,168 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
         roi_basis = current_principal if current_principal > 0 else 1
         total_roi_pct = ((net_asset - current_principal) / roi_basis) * 100
 
-        st.subheader("🏦 資產概況")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("💰 淨資產", f"${int(net_asset):,}")
-        k2.metric("💵 現金餘額", f"${int(data.get('cash', 0)):,}")
-        k3.metric("📊 證券市值", f"${int(total_mkt_val):,}")
-        k4.metric("📉 投入本金", f"${int(current_principal):,}")
-        st.markdown("---")
+        # 將計算結果存入 session_state
+        st.session_state.dashboard_data = {
+            'net_asset': net_asset,
+            'cash': data.get('cash', 0),
+            'total_mkt_val': total_mkt_val,
+            'current_principal': current_principal,
+            'total_day_profit': total_day_profit,
+            'unrealized_profit': unrealized_profit,
+            'total_realized_profit': total_realized_profit,
+            'total_roi_pct': total_roi_pct,
+            'final_rows': final_rows,
+            'temp_list': temp_list
+        }
+
+# --- 顯示層 (移出 button 區塊，只要有資料就顯示) ---
+if st.session_state.dashboard_data:
+    # 從 state 取出資料
+    d = st.session_state.dashboard_data
+    
+    st.subheader("🏦 資產概況")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("💰 淨資產", f"${int(d['net_asset']):,}")
+    k2.metric("💵 現金餘額", f"${int(d['cash']):,}")
+    k3.metric("📊 證券市值", f"${int(d['total_mkt_val']):,}")
+    k4.metric("📉 投入本金", f"${int(d['current_principal']):,}")
+    st.markdown("---")
+    
+    st.subheader("📈 績效表現")
+    kp1, kp2, kp3, kp4 = st.columns(4)
+    kp1.metric("📅 今日損益", f"${int(d['total_day_profit']):+,}")
+    kp2.metric("📄 未實現損益", f"${int(d['unrealized_profit']):+,}")
+    kp3.metric("💰 已實現損益", f"${int(d['total_realized_profit']):+,}")
+    kp4.metric("🏆 總報酬率 (ROI)", f"{d['total_roi_pct']:+.2f}%")
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
+    
+    def color_profit(val):
+        color = 'red' if val > 0 else 'green' if val < 0 else 'black'
+        return f'color: {color}'
+
+    with tab1:
+        if d['final_rows']:
+            df = pd.DataFrame(d['final_rows'])
+            cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
+            df = df[cols]
+            styler = df.style.format({
+                '股數': '{:,}', '成本': '{:,.2f}', '現價': '{:,.2f}',
+                '日損益%': '{:+.2%}', '日損益': '{:+,.0f}',
+                '總損益%': '{:+.2%}', '總損益': '{:+,.0f}',
+                '市值': '{:,.0f}', '占比': '{:.1%}'
+            }).map(color_profit, subset=['日損益%', '日損益', '總損益%', '總損益'])
+            st.dataframe(styler, use_container_width=True, height=500, hide_index=True)
+        else: st.info("無庫存資料")
+
+    with tab2:
+        if d['temp_list']:
+            df_tree = pd.DataFrame(d['temp_list'])
+            fig_tree = px.treemap(
+                df_tree, path=['股票代碼'], values='mkt_val_raw', color='日損益%',
+                color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
+                custom_data=['公司名稱', '日損益%']
+            )
+            fig_tree.update_traces(texttemplate="%{label}<br>%{customdata[0]}<br>%{customdata[1]:+.2%}", textposition="middle center")
+            st.plotly_chart(fig_tree, use_container_width=True)
+        else: st.info("無數據")
+
+    with tab3:
+        st.caption("ℹ️ 資產走勢分析：可切換查看「獲利金額」或「報酬率」 (已排除入金造成的資產虛增)")
         
-        st.subheader("📈 績效表現")
-        kp1, kp2, kp3, kp4 = st.columns(4)
-        kp1.metric("📅 今日損益", f"${int(total_day_profit):+,}")
-        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}")
-        kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}")
-        kp4.metric("🏆 總報酬率 (ROI)", f"{total_roi_pct:+.2f}%")
-
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
-        def color_profit(val):
-            color = 'red' if val > 0 else 'green' if val < 0 else 'black'
-            return f'color: {color}'
-
-        with tab1:
-            if final_rows:
-                df = pd.DataFrame(final_rows)
-                cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
-                df = df[cols]
-                styler = df.style.format({
-                    '股數': '{:,}', '成本': '{:,.2f}', '現價': '{:,.2f}',
-                    '日損益%': '{:+.2%}', '日損益': '{:+,.0f}',
-                    '總損益%': '{:+.2%}', '總損益': '{:+,.0f}',
-                    '市值': '{:,.0f}', '占比': '{:.1%}'
-                }).map(color_profit, subset=['日損益%', '日損益', '總損益%', '總損益'])
-                st.dataframe(styler, use_container_width=True, height=500, hide_index=True)
-            else: st.info("無庫存資料")
-
-        with tab2:
-            if temp_list:
-                df_tree = pd.DataFrame(temp_list)
-                fig_tree = px.treemap(
-                    df_tree, path=['股票代碼'], values='mkt_val_raw', color='日損益%',
-                    color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
-                    custom_data=['公司名稱', '日損益%']
-                )
-                fig_tree.update_traces(texttemplate="%{label}<br>%{customdata[0]}<br>%{customdata[1]:+.2%}", textposition="middle center")
-                st.plotly_chart(fig_tree, use_container_width=True)
-            else: st.info("無數據")
-
-        with tab3:
-            st.caption("ℹ️ 資產走勢分析：可切換查看「獲利金額」或「報酬率」 (已排除入金造成的資產虛增)")
-            
-            if client:
-                hs = get_user_history_sheet(client, username)
-                if hs:
-                    hvals = hs.get_all_values()
-                    if len(hvals) > 1:
-                        headers = hvals[0]
-                        dfh = pd.DataFrame(hvals[1:], columns=headers)
-                        
-                        dfh['Date'] = pd.to_datetime(dfh['Date'])
-                        dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'], errors='coerce').fillna(0)
-                        
-                        if 'Principal' in dfh.columns:
-                            dfh['Principal'] = pd.to_numeric(dfh['Principal'], errors='coerce').fillna(0)
-                        else:
-                            dfh['Principal'] = dfh['NetAsset'] 
-
-                        # 避免本金為 0
-                        dfh['Principal'] = dfh.apply(lambda x: x['NetAsset'] if x['Principal'] == 0 else x['Principal'], axis=1)
-                        dfh = dfh.sort_values('Date')
-
-                        # [核心公式] 損益 = 淨資產 - 本金
-                        dfh['Profit_Val'] = dfh['NetAsset'] - dfh['Principal']
-                        dfh['ROI_Pct'] = (dfh['Profit_Val'] / dfh['Principal']) * 100
-                        
-                        view_type = st.radio("顯示模式", ["💰 總損益金額 (TWD)", "📈 累計報酬率 (%)"], horizontal=True)
-
-                        fig = go.Figure()
-
-                        if view_type == "💰 總損益金額 (TWD)":
-                            fig.add_trace(go.Scatter(
-                                x=dfh['Date'], y=dfh['Profit_Val'],
-                                mode='lines+markers', name='總損益金額',
-                                line=dict(color='#d62728', width=3),
-                                fill='tozeroy', 
-                                fillcolor='rgba(214, 39, 40, 0.1)',
-                                hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>損益</b>: $%{y:,.0f}<extra></extra>'
-                            ))
-                            yaxis_format = ",.0f"
-                            y_title = "損益金額 (TWD)"
-                            
-                        else:
-                            fig.add_trace(go.Scatter(
-                                x=dfh['Date'], y=dfh['ROI_Pct'],
-                                mode='lines+markers', name='我的報酬率',
-                                line=dict(color='#d62728', width=3),
-                                hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<extra></extra>'
-                            ))
-
-                            if not dfh.empty:
-                                start_date = dfh['Date'].min().strftime('%Y-%m-%d')
-                                benchmarks = get_benchmark_data(start_date)
-                                colors = {'0050.TW': 'blue', 'SPY': 'green', 'QQQ': 'purple'}
-                                for name, series in benchmarks.items():
-                                    aligned_series = series[series.index >= dfh['Date'].min()]
-                                    fig.add_trace(go.Scatter(
-                                        x=aligned_series.index, y=aligned_series.values,
-                                        mode='lines', name=name,
-                                        line=dict(color=colors.get(name, 'gray'), width=1, dash='dot'),
-                                        hovertemplate=f'<b>{name}</b>: %{{y:.2f}}%<extra></extra>'
-                                    ))
-                            yaxis_format = ".2f"
-                            y_title = "累計報酬率 (%)"
-
-                        fig.update_layout(
-                            xaxis_title="日期", 
-                            yaxis_title=y_title,
-                            hovermode="x unified",
-                            yaxis=dict(tickformat=yaxis_format),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                            height=500
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+        if client:
+            hs = get_user_history_sheet(client, username)
+            if hs:
+                hvals = hs.get_all_values()
+                if len(hvals) > 1:
+                    headers = hvals[0]
+                    dfh = pd.DataFrame(hvals[1:], columns=headers)
+                    
+                    dfh['Date'] = pd.to_datetime(dfh['Date'])
+                    dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'], errors='coerce').fillna(0)
+                    
+                    if 'Principal' in dfh.columns:
+                        dfh['Principal'] = pd.to_numeric(dfh['Principal'], errors='coerce').fillna(0)
                     else:
-                        st.info("尚無歷史資料，請先執行一次「更新即時報價」。")
-            else:
-                st.error("無法讀取歷史資料 (Client Error)")
+                        dfh['Principal'] = dfh['NetAsset'] 
 
-        with tab4:
-            history = data.get('history', [])
-            if history:
-                df_hist = pd.DataFrame(history[::-1])
-                st.subheader(f"累計已實現損益: ${int(total_realized_profit):+,}")
-                if not df_hist.empty:
-                    df_hist = df_hist[['d', 'code', 'name', 'qty', 'buy_cost', 'sell_rev', 'profit', 'roi']]
-                    df_hist.columns = ['日期', '代碼', '名稱', '賣出股數', '總成本', '賣出收入', '獲利金額', '報酬率%']
-                    df_hist['報酬率%'] = df_hist['報酬率%'] / 100
-                    styler_h = df_hist.style.format({
-                        '賣出股數': '{:,}', '總成本': '{:,.0f}', '賣出收入': '{:,.0f}',
-                        '獲利金額': '{:+,.0f}', '報酬率%': '{:+.2%}'
-                    }).map(color_profit, subset=['獲利金額', '報酬率%'])
-                    st.dataframe(styler_h, use_container_width=True, hide_index=True)
-            else: st.info("尚無賣出紀錄")
+                    # 避免本金為 0
+                    dfh['Principal'] = dfh.apply(lambda x: x['NetAsset'] if x['Principal'] == 0 else x['Principal'], axis=1)
+                    dfh = dfh.sort_values('Date')
+
+                    # [核心公式] 損益 = 淨資產 - 本金
+                    dfh['Profit_Val'] = dfh['NetAsset'] - dfh['Principal']
+                    dfh['ROI_Pct'] = (dfh['Profit_Val'] / dfh['Principal']) * 100
+                    
+                    # 這裡切換 Radio Button 時，因為外層不在 button 內，所以圖表不會消失
+                    view_type = st.radio("顯示模式", ["💰 總損益金額 (TWD)", "📈 累計報酬率 (%)"], horizontal=True)
+
+                    fig = go.Figure()
+
+                    if view_type == "💰 總損益金額 (TWD)":
+                        fig.add_trace(go.Scatter(
+                            x=dfh['Date'], y=dfh['Profit_Val'],
+                            mode='lines+markers', name='總損益金額',
+                            line=dict(color='#d62728', width=3),
+                            fill='tozeroy', 
+                            fillcolor='rgba(214, 39, 40, 0.1)',
+                            hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>損益</b>: $%{y:,.0f}<extra></extra>'
+                        ))
+                        yaxis_format = ",.0f"
+                        y_title = "損益金額 (TWD)"
+                        
+                    else:
+                        fig.add_trace(go.Scatter(
+                            x=dfh['Date'], y=dfh['ROI_Pct'],
+                            mode='lines+markers', name='我的報酬率',
+                            line=dict(color='#d62728', width=3),
+                            hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<extra></extra>'
+                        ))
+
+                        if not dfh.empty:
+                            start_date = dfh['Date'].min().strftime('%Y-%m-%d')
+                            benchmarks = get_benchmark_data(start_date)
+                            colors = {'0050.TW': 'blue', 'SPY': 'green', 'QQQ': 'purple'}
+                            for name, series in benchmarks.items():
+                                aligned_series = series[series.index >= dfh['Date'].min()]
+                                fig.add_trace(go.Scatter(
+                                    x=aligned_series.index, y=aligned_series.values,
+                                    mode='lines', name=name,
+                                    line=dict(color=colors.get(name, 'gray'), width=1, dash='dot'),
+                                    hovertemplate=f'<b>{name}</b>: %{{y:.2f}}%<extra></extra>'
+                                ))
+                        yaxis_format = ".2f"
+                        y_title = "累計報酬率 (%)"
+
+                    fig.update_layout(
+                        xaxis_title="日期", 
+                        yaxis_title=y_title,
+                        hovermode="x unified",
+                        yaxis=dict(tickformat=yaxis_format),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        height=500
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("尚無歷史資料，請先執行一次「更新即時報價」。")
+        else:
+            st.error("無法讀取歷史資料 (Client Error)")
+
+    with tab4:
+        history = data.get('history', [])
+        if history:
+            df_hist = pd.DataFrame(history[::-1])
+            st.subheader(f"累計已實現損益: ${int(d['total_realized_profit']):+,}")
+            if not df_hist.empty:
+                df_hist = df_hist[['d', 'code', 'name', 'qty', 'buy_cost', 'sell_rev', 'profit', 'roi']]
+                df_hist.columns = ['日期', '代碼', '名稱', '賣出股數', '總成本', '賣出收入', '獲利金額', '報酬率%']
+                df_hist['報酬率%'] = df_hist['報酬率%'] / 100
+                styler_h = df_hist.style.format({
+                    '賣出股數': '{:,}', '總成本': '{:,.0f}', '賣出收入': '{:,.0f}',
+                    '獲利金額': '{:+,.0f}', '報酬率%': '{:+.2%}'
+                }).map(color_profit, subset=['獲利金額', '報酬率%'])
+                st.dataframe(styler_h, use_container_width=True, hide_index=True)
+        else: st.info("尚無賣出紀錄")
 
 else:
-    st.info("👆 請點擊上方按鈕更新")
+    st.info("👆 請點擊上方按鈕，開始載入您的投資組合數據")
