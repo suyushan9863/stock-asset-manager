@@ -6,6 +6,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import plotly.express as px
+import plotly.graph_objects as go
 
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家", layout="wide", page_icon="📈")
@@ -96,18 +97,14 @@ def record_history(client, username, net_asset):
     if hist_sheet and net_asset > 0:
         today = datetime.now().strftime('%Y-%m-%d')
         try:
-            # 檢查最後一筆是否為今天，避免重複寫入
             all_values = hist_sheet.get_all_values()
             if len(all_values) > 1:
                 last_row = all_values[-1]
                 if last_row[0] == today:
-                    # 如果今天是同一天，更新數值而不是新增一行 (保持最新狀態)
                     row_index = len(all_values)
                     hist_sheet.update_cell(row_index, 2, int(net_asset))
                     return
         except: pass
-        
-        # 如果是新的一天，新增一行
         hist_sheet.append_row([today, int(net_asset)])
 
 # --- 核心計算邏輯 ---
@@ -406,7 +403,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
         kp4.metric("🏆 總合損益", f"${int(grand_total_profit):+,}", delta=f"{grand_total_roi:+.2f}%")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 淨資產走勢", "📜 已實現損益"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 淨資產報酬率", "📜 已實現損益"])
         def color_profit(val):
             color = 'red' if val > 0 else 'green' if val < 0 else 'black'
             return f'color: {color}'
@@ -438,22 +435,44 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             else: st.info("無數據")
 
         with tab3:
-            st.caption("ℹ️ 此圖顯示您的「淨資產絕對金額」歷史走勢 (資料來源: Google Sheets)。")
+            st.caption("ℹ️ 此圖顯示您的「累計報酬率 (%)」，起點為 0%。這能更直觀地看出資產增長的幅度。")
             if client:
                 hs = get_user_history_sheet(client, username)
                 if hs:
                     hvals = hs.get_all_values()
                     if len(hvals) > 1:
-                        # 簡單暴力：只讀取 Google Sheets 畫圖，不依賴任何外部資料
                         dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
                         dfh['Date'] = pd.to_datetime(dfh['Date'])
                         dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
                         dfh = dfh.sort_values('Date')
                         
-                        fig = px.line(dfh, x='Date', y='NetAsset', markers=True, title=f"淨資產走勢 ({username})")
-                        fig.update_traces(line_color='#1f77b4', line_width=3)
-                        fig.update_layout(xaxis_title="日期", yaxis_title="淨資產 (TWD)", hovermode="x unified")
-                        st.plotly_chart(fig, use_container_width=True)
+                        # --- 關鍵修改：歸一化計算 (計算成長百分比) ---
+                        first_val = dfh['NetAsset'].iloc[0]
+                        if first_val > 0:
+                            dfh['Growth'] = (dfh['NetAsset'] / first_val - 1) * 100
+                            
+                            # 繪圖
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=dfh['Date'], 
+                                y=dfh['Growth'],
+                                mode='lines+markers',
+                                name='累計報酬率',
+                                line=dict(color='#d62728', width=3),
+                                customdata=dfh['NetAsset'], # 把淨值藏在 customdata 裡
+                                hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<br><b>淨資產</b>: $%{customdata:,}<extra></extra>'
+                            ))
+                            
+                            fig.update_layout(
+                                title=f"資產成長走勢 ({username})",
+                                xaxis_title="日期",
+                                yaxis_title="累計報酬率 (%)",
+                                hovermode="x unified",
+                                yaxis=dict(tickformat=".2f", ticksuffix="%")
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.warning("起始淨資產為 0，無法計算成長率。")
                     else: st.info("歷史資料不足 (尚未累積數據)")
             else: st.error("無法讀取歷史")
 
