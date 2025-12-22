@@ -179,7 +179,6 @@ st.title(f"📈 資產管家 - {username}")
 
 # --- 側邊欄：完整功能區 ---
 with st.sidebar:
-    # 1. 資金管理
     st.header("💰 資金與交易")
     st.metric("現金餘額", f"${int(data.get('cash', 0)):,}")
     with st.expander("💵 資金存提"):
@@ -191,7 +190,7 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # 2. 買入
+    # 買入
     st.subheader("🔵 買入股票")
     code_in = st.text_input("買入代碼 (如 2330.TW)").strip().upper()
     c1, c2 = st.columns(2)
@@ -232,7 +231,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # 3. 賣出
+    # 賣出
     st.subheader("🔴 賣出股票")
     holdings_list = list(data.get('h', {}).keys())
     if holdings_list:
@@ -292,7 +291,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # 4. 修正/刪除 (關鍵功能：移到側邊欄)
+    # 修正/刪除
     with st.expander("🔧 庫存修正/刪除 (輸入錯誤用)"):
         st.warning("⚠️ 此功能用於刪除「輸入錯誤」的紀錄，會將當初的自備款退回現金。")
         del_list = list(data.get('h', {}).keys())
@@ -300,22 +299,18 @@ with st.sidebar:
             to_del_code = st.selectbox("選擇要刪除的代碼", ["請選擇"] + del_list, key="force_del_select")
             if to_del_code != "請選擇":
                 if st.button(f"確認強制刪除 {to_del_code}"):
-                    # 計算應退回的本金
                     t_back = 0
                     is_tw = ('.TW' in to_del_code or '.TWO' in to_del_code)
                     rate = 1.0 if is_tw else get_usdtwd()
-                    
                     for l in data['h'][to_del_code].get('lots', []):
                         cost_t = l['p'] * l['s'] * rate
                         debt = l.get('debt', 0)
                         t_back += (cost_t - debt)
-                    
                     data['cash'] += t_back
                     del data['h'][to_del_code]
                     save_data(sheet, data)
                     st.success(f"已刪除 {to_del_code}，並退回資金。"); st.rerun()
-        else:
-            st.info("無資料可刪除")
+        else: st.info("無資料可刪除")
 
 
 # --- 主畫面 ---
@@ -332,7 +327,6 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
 
         for code, info in h.items():
             cur_p, change_val, change_pct = get_price_data(code)
-            # 防呆：如果抓不到價格，就用成本價，避免崩潰
             if cur_p is None or pd.isna(cur_p): cur_p = info['c']
             
             rate = 1.0 if ('.TW' in code or '.TWO' in code) else usdtwd
@@ -372,16 +366,35 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         unrealized_profit = total_mkt_val - total_cost_val
         if client: record_history(client, username, net_asset)
 
-        total_realized = sum(r.get('profit', 0) for r in data.get('history', []))
+        # 計算已實現損益
+        total_realized_profit = 0
+        total_realized_cost = 0
+        for r in data.get('history', []):
+            total_realized_profit += r.get('profit', 0)
+            total_realized_cost += r.get('buy_cost', 0)
+
+        # --- 計算整體 ROI ---
+        # 1. 未實現 ROI = 未實現損益 / 總成本
+        total_unrealized_roi = (unrealized_profit / total_cost_val * 100) if total_cost_val > 0 else 0
+        
+        # 2. 今日 ROI (估算) = 今日損益 / 昨日市值
+        # 昨日市值約等於 = 目前市值 - 今日損益
+        yesterday_mkt_val = total_mkt_val - total_day_profit
+        total_day_roi = (total_day_profit / yesterday_mkt_val * 100) if yesterday_mkt_val > 0 else 0
+        
+        # 3. 已實現 ROI = 已實現總損益 / 已實現總成本
+        total_realized_roi = (total_realized_profit / total_realized_cost * 100) if total_realized_cost > 0 else 0
 
         # KPI
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric("💰 淨資產", f"${int(net_asset):,}")
         k2.metric("📊 總市值", f"${int(total_mkt_val):,}")
         k3.metric("💸 總負債", f"${int(total_debt):,}", delta_color="inverse")
-        k4.metric("📅 今日總損益", f"${int(total_day_profit):+,}", delta=(int(total_day_profit) if total_day_profit!=0 else None))
-        k5.metric("未實現損益", f"${int(unrealized_profit):+,}", delta_color="normal")
-        k6.metric("已實現損益", f"${int(total_realized):+,}", delta=(int(total_realized) if total_realized!=0 else None))
+        
+        # 加上百分比顯示
+        k4.metric("📅 今日總損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
+        k5.metric("未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}%")
+        k6.metric("已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
 
         tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 走勢圖", "📜 已實現損益"])
         def color_profit(val):
@@ -434,7 +447,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             history = data.get('history', [])
             if history:
                 df_hist = pd.DataFrame(history[::-1])
-                st.subheader(f"累計已實現損益: ${int(total_realized):+,}")
+                st.subheader(f"累計已實現損益: ${int(total_realized_profit):+,}")
                 if not df_hist.empty:
                     df_hist = df_hist[['d', 'code', 'name', 'qty', 'buy_cost', 'sell_rev', 'profit', 'roi']]
                     df_hist.columns = ['日期', '代碼', '名稱', '賣出股數', '總成本', '賣出收入', '獲利金額', '報酬率%']
