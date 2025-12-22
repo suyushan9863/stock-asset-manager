@@ -10,13 +10,14 @@ import plotly.express as px
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家", layout="wide", page_icon="📈")
 
-# --- 股票代碼與名稱對照表 (可自行擴充) ---
+# --- 股票代碼與名稱對照表 ---
 STOCK_MAP = {
     '2330.TW': '台積電', '2317.TW': '鴻海', '2454.TW': '聯發科',
     '2603.TW': '長榮', '2609.TW': '陽明', '2615.TW': '萬海',
     '3231.TW': '緯創', '2382.TW': '廣達', '3017.TW': '奇鋐',
     '2301.TW': '光寶科', '00685L.TW': '群益台指正2', '00670L.TW': '元大NASDAQ正2',
-    'NVDA': '輝達', 'AAPL': '蘋果', 'TSLA': '特斯拉', 'AMD': '超微'
+    'NVDA': '輝達', 'AAPL': '蘋果', 'TSLA': '特斯拉', 'AMD': '超微',
+    'MSFT': '微軟', 'GOOG': '谷歌', 'AMZN': '亞馬遜'
 }
 
 # --- Google Sheets 連線與資料處理 ---
@@ -56,11 +57,19 @@ def get_history_sheet(client):
     except: return None
 
 def load_data(sheet):
-    if not sheet: return {'h': {}, 'cash': 0.0}
+    # 預設資料結構
+    default_data = {'h': {}, 'cash': 0.0, 'history': []}
+    if not sheet: return default_data
     try:
         raw_data = sheet.acell('A1').value
         if raw_data:
             data = json.loads(raw_data)
+            # 確保欄位齊全
+            if 'h' not in data: data['h'] = {}
+            if 'cash' not in data: data['cash'] = 0.0
+            if 'history' not in data: data['history'] = []
+            
+            # 資料結構防呆 (Lots)
             for code in data.get('h', {}):
                 if 'lots' not in data['h'][code]:
                     data['h'][code]['lots'] = [{
@@ -68,7 +77,7 @@ def load_data(sheet):
                     }]
             return data
     except: pass
-    return {'h': {}, 'cash': 0.0}
+    return default_data
 
 def save_data(sheet, data):
     if sheet:
@@ -134,7 +143,7 @@ if not sheet:
     st.error("⚠️ 無法連接 Google Sheets，請檢查 Secrets 設定。")
     st.stop()
 
-# --- 側邊欄：交易面板 ---
+# --- 側邊欄 ---
 with st.sidebar:
     st.header("💰 資金與交易")
     st.metric("現金餘額", f"${int(data.get('cash', 0)):,}")
@@ -147,19 +156,20 @@ with st.sidebar:
             st.success("資金已更新"); st.rerun()
 
     st.markdown("---")
-    st.subheader("下單交易")
-    code_in = st.text_input("代碼 (如 2330.TW)").strip().upper()
-    col1, col2 = st.columns(2)
-    shares_in = col1.number_input("股數", min_value=1, value=1000, step=100)
-    cost_in = col2.number_input("成交單價", min_value=0.0, value=0.0, step=0.1, format="%.2f")
-    trade_type = st.radio("交易類別", ["現股", "融資"], horizontal=True)
+    
+    # === 買入區塊 ===
+    st.subheader("🔵 買入股票")
+    code_in = st.text_input("買入代碼 (如 2330.TW)").strip().upper()
+    c1, c2 = st.columns(2)
+    shares_in = c1.number_input("買入股數", min_value=1, value=1000, step=100)
+    cost_in = c2.number_input("買入單價", min_value=0.0, value=0.0, step=0.1, format="%.2f")
+    trade_type = st.radio("類別", ["現股", "融資"], horizontal=True, key="buy_type")
     
     margin_ratio = 1.0
-    debt = 0
     if trade_type == "融資":
         margin_ratio = st.slider("自備款成數", 0.1, 0.9, 0.4, 0.1)
 
-    if st.button("買入 / 加碼確認", type="primary"):
+    if st.button("確認買入", type="primary"):
         if code_in and cost_in > 0:
             if 'h' not in data: data['h'] = {}
             rate = 1.0 if ('.TW' in code_in or '.TWO' in code_in) else get_usdtwd()
@@ -184,8 +194,103 @@ with st.sidebar:
                 else:
                     data['h'][code_in] = {'s': shares_in, 'c': cost_in, 'n': code_in, 'lots': [new_lot]}
                 save_data(sheet, data)
-                st.success(f"交易成功！{code_in}"); st.balloons(); st.rerun()
+                st.success(f"買入成功！{code_in}"); st.rerun()
         else: st.error("資料不完整")
+
+    st.markdown("---")
+
+    # === 賣出區塊 (新增) ===
+    st.subheader("🔴 賣出股票")
+    # 建立持有股票選單
+    holdings_list = list(data.get('h', {}).keys())
+    if holdings_list:
+        sell_code = st.selectbox("選擇賣出代碼", ["請選擇"] + holdings_list)
+        
+        if sell_code != "請選擇":
+            current_hold = data['h'][sell_code]['s']
+            st.caption(f"目前持有: {current_hold} 股")
+            
+            sc1, sc2 = st.columns(2)
+            sell_qty = sc1.number_input("賣出股數", min_value=1, max_value=int(current_hold), value=int(current_hold), step=100)
+            sell_price = sc2.number_input("賣出單價", min_value=0.0, value=0.0, step=0.1, format="%.2f")
+            
+            if st.button("確認賣出 (實現損益)"):
+                if sell_price > 0:
+                    info = data['h'][sell_code]
+                    lots = info.get('lots', [])
+                    
+                    rate = 1.0 if ('.TW' in sell_code or '.TWO' in sell_code) else get_usdtwd()
+                    
+                    # 計算總賣出收入
+                    sell_revenue = sell_qty * sell_price * rate
+                    
+                    # FIFO 扣庫存邏輯
+                    remain_to_sell = sell_qty
+                    total_cost_basis = 0
+                    total_debt_repaid = 0
+                    new_lots = []
+                    
+                    for lot in lots:
+                        if remain_to_sell > 0:
+                            take_qty = min(lot['s'], remain_to_sell)
+                            
+                            # 計算此批次成本與負債
+                            lot_cost = take_qty * lot['p'] * rate
+                            lot_debt = lot.get('debt', 0) * (take_qty / lot['s']) if lot['s'] > 0 else 0
+                            
+                            total_cost_basis += lot_cost
+                            total_debt_repaid += lot_debt
+                            
+                            # 更新批次
+                            lot['s'] -= take_qty
+                            lot['debt'] -= lot_debt
+                            remain_to_sell -= take_qty
+                            
+                            if lot['s'] > 0: new_lots.append(lot)
+                        else:
+                            new_lots.append(lot)
+                    
+                    # 計算已實現損益
+                    realized_profit = sell_revenue - total_cost_basis
+                    realized_roi = (realized_profit / total_cost_basis * 100) if total_cost_basis else 0
+                    
+                    # 更新現金 (收入 - 償還負債)
+                    cash_back = sell_revenue - total_debt_repaid
+                    data['cash'] += cash_back
+                    
+                    # 更新庫存
+                    if new_lots:
+                        data['h'][sell_code]['lots'] = new_lots
+                        data['h'][sell_code]['s'] -= sell_qty
+                        # 重新計算均價
+                        ts = sum(l['s'] for l in new_lots)
+                        tc = sum(l['s']*l['p'] for l in new_lots)
+                        data['h'][sell_code]['c'] = tc / ts if ts else 0
+                    else:
+                        del data['h'][sell_code]
+                    
+                    # 寫入歷史紀錄
+                    if 'history' not in data: data['history'] = []
+                    data['history'].append({
+                        'd': datetime.now().strftime('%Y-%m-%d'),
+                        'code': sell_code,
+                        'name': STOCK_MAP.get(sell_code, sell_code),
+                        'qty': sell_qty,
+                        'buy_cost': total_cost_basis,
+                        'sell_rev': sell_revenue,
+                        'profit': realized_profit,
+                        'roi': realized_roi
+                    })
+                    
+                    save_data(sheet, data)
+                    st.success(f"賣出成功！獲利: ${int(realized_profit):,}")
+                    st.balloons()
+                    st.rerun()
+                else:
+                    st.error("請輸入賣出價格")
+    else:
+        st.info("目前無庫存可賣")
+
 
 # --- 主畫面 ---
 if st.button("🔄 更新即時報價與走勢", type="primary", use_container_width=True):
@@ -193,7 +298,6 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         usdtwd = get_usdtwd()
         h = data.get('h', {})
         
-        # 1. 先跑一輪計算總市值，為了算「占比」
         temp_list = []
         total_mkt_val = 0.0
         total_cost_val = 0.0
@@ -208,130 +312,87 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             c_val = float(info['c'])
             p_val = float(cur_p)
             
-            # 市值與損益
             mkt_val = p_val * s_val * rate
             cost_val = c_val * s_val * rate
             total_profit_val = mkt_val - cost_val
             total_profit_pct = (total_profit_val / cost_val * 100) if cost_val else 0
-            
-            # 日損益 (簡單估算：今日漲跌金額 * 股數 * 匯率)
             day_profit_val = change_val * s_val * rate
             
-            # 負債
             stock_debt = sum(l.get('debt', 0) for l in info.get('lots', []))
             
             total_mkt_val += mkt_val
             total_cost_val += cost_val
             total_debt += stock_debt
 
-            # 抓取中文名稱 (如果沒有就顯示代碼)
             name = STOCK_MAP.get(code, code)
 
             temp_list.append({
-                "raw_code": code, # 隱藏欄位，用於排序或連結
+                "raw_code": code,
                 "股票代碼": code,
                 "公司名稱": name,
                 "股數": int(s_val),
                 "成本": c_val,
                 "現價": p_val,
-                "日損益%": change_pct / 100, # 除100以便後續格式化
+                "日損益%": change_pct / 100,
                 "日損益": day_profit_val,
                 "總損益%": total_profit_pct / 100,
                 "總損益": total_profit_val,
                 "市值": mkt_val,
-                "mkt_val_raw": mkt_val # 用於計算占比
+                "mkt_val_raw": mkt_val
             })
 
-        # 2. 計算占比並整理表格
         final_rows = []
         for item in temp_list:
             weight = (item['mkt_val_raw'] / total_mkt_val) if total_mkt_val > 0 else 0
             item["占比"] = weight
             final_rows.append(item)
 
-        # 3. 總計數據
         net_asset = (total_mkt_val + data['cash']) - total_debt
         unrealized_profit = total_mkt_val - total_cost_val
         if client: record_history(client, net_asset)
 
-        # --- 顯示 KPI ---
-        k1, k2, k3, k4 = st.columns(4)
+        # 計算已實現總損益
+        total_realized = sum(r.get('profit', 0) for r in data.get('history', []))
+
+        # --- KPI ---
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("💰 淨資產", f"${int(net_asset):,}")
         k2.metric("📊 總市值", f"${int(total_mkt_val):,}")
         k3.metric("💸 總負債", f"${int(total_debt):,}", delta_color="inverse")
         k4.metric("未實現損益", f"${int(unrealized_profit):+,}", delta_color="normal")
+        k5.metric("已實現損益", f"${int(total_realized):+,}", delta=(int(total_realized) if total_realized!=0 else None))
 
         # --- Tabs ---
-        tab1, tab2, tab3 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 走勢圖"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 走勢圖", "📜 已實現損益"])
+
+        def color_profit(val):
+            color = 'red' if val > 0 else 'green' if val < 0 else 'black'
+            return f'color: {color}'
 
         with tab1:
             if final_rows:
                 df = pd.DataFrame(final_rows)
-                
-                # 設定顯示欄位順序
                 cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
                 df = df[cols]
-
-                # Pandas Styler: 依據圖片風格設計
-                # 定義格式化函數
-                def color_profit(val):
-                    color = 'red' if val > 0 else 'green' if val < 0 else 'black'
-                    return f'color: {color}'
-
-                # 建立 Styler
                 styler = df.style.format({
-                    '股數': '{:,}',
-                    '成本': '{:,.2f}',
-                    '現價': '{:,.2f}',
-                    '日損益%': '{:+.2%}',
-                    '日損益': '{:+,.0f}',
-                    '總損益%': '{:+.2%}',
-                    '總損益': '{:+,.0f}',
-                    '市值': '{:,.0f}',
-                    '占比': '{:.1%}'
-                })
-                
-                # 套用顏色 (針對數值欄位)
-                styler = styler.map(color_profit, subset=['日損益%', '日損益', '總損益%', '總損益'])
-                
-                # 顯示表格
+                    '股數': '{:,}', '成本': '{:,.2f}', '現價': '{:,.2f}',
+                    '日損益%': '{:+.2%}', '日損益': '{:+,.0f}',
+                    '總損益%': '{:+.2%}', '總損益': '{:+,.0f}',
+                    '市值': '{:,.0f}', '占比': '{:.1%}'
+                }).map(color_profit, subset=['日損益%', '日損益', '總損益%', '總損益'])
                 st.dataframe(styler, use_container_width=True, height=500, hide_index=True)
-                
-                # 刪除功能
-                st.markdown("---")
-                to_del = st.selectbox("選擇要刪除的股票", ["請選擇"] + [r['股票代碼'] for r in final_rows])
-                if to_del != "請選擇" and st.button(f"確認刪除 {to_del}"):
-                    # 計算退回金額
-                    t_back = 0
-                    rate = 1.0 if ('.TW' in to_del or '.TWO' in to_del) else usdtwd
-                    for l in h[to_del].get('lots', []):
-                        cost_t = l['p'] * l['s'] * rate
-                        debt = l.get('debt', 0)
-                        t_back += (cost_t - debt)
-                    data['cash'] += t_back
-                    del data['h'][to_del]
-                    save_data(sheet, data)
-                    st.success("已刪除"); st.rerun()
             else:
                 st.info("無庫存資料")
 
         with tab2:
             if temp_list:
                 df_tree = pd.DataFrame(temp_list)
-                # 修正：使用 'RdYlGn_r' (紅-黃-綠 反轉)，讓紅色代表高數值(漲)，綠色代表低數值(跌)
                 fig_tree = px.treemap(
-                    df_tree, 
-                    path=['股票代碼'], 
-                    values='mkt_val_raw',
-                    color='日損益%',
-                    color_continuous_scale='RdYlGn_r', 
-                    color_continuous_midpoint=0,
+                    df_tree, path=['股票代碼'], values='mkt_val_raw', color='日損益%',
+                    color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
                     custom_data=['公司名稱', '日損益%']
                 )
-                fig_tree.update_traces(
-                    texttemplate="%{label}<br>%{customdata[0]}<br>%{customdata[1]:+.2%}",
-                    textposition="middle center"
-                )
+                fig_tree.update_traces(texttemplate="%{label}<br>%{customdata[0]}<br>%{customdata[1]:+.2%}", textposition="middle center")
                 st.plotly_chart(fig_tree, use_container_width=True)
             else: st.info("無數據")
 
@@ -350,6 +411,32 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                         st.plotly_chart(fig, use_container_width=True)
                     else: st.info("累積數據不足")
             else: st.error("無法讀取歷史")
+
+        with tab4:
+            history = data.get('history', [])
+            if history:
+                # 反轉列表，讓最新的在最上面
+                df_hist = pd.DataFrame(history[::-1])
+                st.subheader(f"累計已實現損益: ${int(total_realized):+,}")
+                
+                if not df_hist.empty:
+                    df_hist = df_hist[['d', 'code', 'name', 'qty', 'buy_cost', 'sell_rev', 'profit', 'roi']]
+                    df_hist.columns = ['日期', '代碼', '名稱', '賣出股數', '總成本', '賣出收入', '獲利金額', '報酬率%']
+                    
+                    # 格式化
+                    df_hist['報酬率%'] = df_hist['報酬率%'] / 100
+                    
+                    styler_h = df_hist.style.format({
+                        '賣出股數': '{:,}',
+                        '總成本': '{:,.0f}',
+                        '賣出收入': '{:,.0f}',
+                        '獲利金額': '{:+,.0f}',
+                        '報酬率%': '{:+.2%}'
+                    }).map(color_profit, subset=['獲利金額', '報酬率%'])
+                    
+                    st.dataframe(styler_h, use_container_width=True, hide_index=True)
+            else:
+                st.info("尚無賣出紀錄")
 
 else:
     st.info("👆 請點擊上方按鈕更新")
