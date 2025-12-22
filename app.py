@@ -179,6 +179,7 @@ st.title(f"📈 資產管家 - {username}")
 
 # --- 側邊欄：完整功能區 ---
 with st.sidebar:
+    # 1. 資金管理
     st.header("💰 資金與交易")
     st.metric("現金餘額", f"${int(data.get('cash', 0)):,}")
     with st.expander("💵 資金存提"):
@@ -190,7 +191,7 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # 買入
+    # 2. 買入
     st.subheader("🔵 買入股票")
     code_in = st.text_input("買入代碼 (如 2330.TW)").strip().upper()
     c1, c2 = st.columns(2)
@@ -231,7 +232,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # 賣出
+    # 3. 賣出
     st.subheader("🔴 賣出股票")
     holdings_list = list(data.get('h', {}).keys())
     if holdings_list:
@@ -291,7 +292,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # 修正/刪除
+    # 4. 修正/刪除
     with st.expander("🔧 庫存修正/刪除 (輸入錯誤用)"):
         st.warning("⚠️ 此功能用於刪除「輸入錯誤」的紀錄，會將當初的自備款退回現金。")
         del_list = list(data.get('h', {}).keys())
@@ -374,27 +375,37 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             total_realized_cost += r.get('buy_cost', 0)
 
         # --- 計算整體 ROI ---
-        # 1. 未實現 ROI = 未實現損益 / 總成本
         total_unrealized_roi = (unrealized_profit / total_cost_val * 100) if total_cost_val > 0 else 0
-        
-        # 2. 今日 ROI (估算) = 今日損益 / 昨日市值
-        # 昨日市值約等於 = 目前市值 - 今日損益
         yesterday_mkt_val = total_mkt_val - total_day_profit
         total_day_roi = (total_day_profit / yesterday_mkt_val * 100) if yesterday_mkt_val > 0 else 0
-        
-        # 3. 已實現 ROI = 已實現總損益 / 已實現總成本
         total_realized_roi = (total_realized_profit / total_realized_cost * 100) if total_realized_cost > 0 else 0
 
-        # KPI
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        # 計算「總合損益」 (未實現 + 已實現)
+        grand_total_profit = unrealized_profit + total_realized_profit
+        grand_total_cost = total_cost_val + total_realized_cost
+        grand_total_roi = (grand_total_profit / grand_total_cost * 100) if grand_total_cost > 0 else 0
+
+        # KPI 版面配置 (兩列式)
+        # 第一列：資產概況
+        st.subheader("🏦 資產概況")
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("💰 淨資產", f"${int(net_asset):,}")
-        k2.metric("📊 總市值", f"${int(total_mkt_val):,}")
-        k3.metric("💸 總負債", f"${int(total_debt):,}", delta_color="inverse")
+        k2.metric("💵 現金餘額", f"${int(data.get('cash', 0)):,}")
+        k3.metric("📊 證券市值", f"${int(total_mkt_val):,}")
+        k4.metric("💸 融資負債", f"${int(total_debt):,}", delta_color="inverse")
         
-        # 加上百分比顯示
-        k4.metric("📅 今日總損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
-        k5.metric("未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}%")
-        k6.metric("已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
+        st.markdown("---")
+        
+        # 第二列：損益績效
+        st.subheader("📈 績效表現")
+        kp1, kp2, kp3, kp4 = st.columns(4)
+        
+        kp1.metric("📅 今日損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
+        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}%")
+        kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
+        
+        # 總合損益 (顯示整體戰果)
+        kp4.metric("🏆 總合損益", f"${int(grand_total_profit):+,}", delta=f"{grand_total_roi:+.2f}%")
 
         tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 走勢圖", "📜 已實現損益"])
         def color_profit(val):
