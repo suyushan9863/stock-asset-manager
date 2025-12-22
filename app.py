@@ -326,8 +326,9 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         total_debt = 0.0
         total_day_profit = 0.0
 
-        for code, info in h.items():
+       for code, info in h.items():
             cur_p, change_val, change_pct = get_price_data(code)
+            # 防呆：如果抓不到價格，就用成本價，避免崩潰
             if cur_p is None or pd.isna(cur_p): cur_p = info['c']
             
             rate = 1.0 if ('.TW' in code or '.TWO' in code) else usdtwd
@@ -335,26 +336,59 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             c_val = float(info['c'])
             p_val = float(cur_p)
             
-            mkt_val = p_val * s_val * rate
-            cost_val = c_val * s_val * rate
-            total_profit_val = mkt_val - cost_val
-            total_profit_pct = (total_profit_val / cost_val * 100) if cost_val else 0
+            # 1. 基礎數值計算
+            mkt_val = p_val * s_val * rate          # 目前市值
+            cost_val = c_val * s_val * rate         # 總成本 (含借款)
             
+            # 2. 計算該股票的總融資負債
+            stock_debt = sum(l.get('debt', 0) for l in info.get('lots', []))
+            
+            # 3. 計算損益金額 (市值 - 總成本)
+            # 註：融資獲利的絕對金額跟現股一樣，都是股價差額
+            total_profit_val = mkt_val - cost_val
+            
+            # 4. 【關鍵修改】計算真實投入本金 (總成本 - 負債)
+            actual_principal = cost_val - stock_debt
+            
+            # 5. 【關鍵修改】計算槓桿報酬率 (損益 / 本金)
+            if actual_principal > 0:
+                total_profit_pct = (total_profit_val / actual_principal * 100)
+            else:
+                total_profit_pct = 0
+            
+            # 日損益
             day_profit_val = change_val * s_val * rate
             total_day_profit += day_profit_val
             
-            stock_debt = sum(l.get('debt', 0) for l in info.get('lots', []))
+            # 累加總數
             total_mkt_val += mkt_val
             total_cost_val += cost_val
             total_debt += stock_debt
 
             name = STOCK_MAP.get(code, code)
+            
+            # 判斷是否使用槓桿 (顯示用途)
+            leverage_tag = ""
+            if stock_debt > 0:
+                # 簡單計算槓桿倍數
+                lev = cost_val / actual_principal if actual_principal else 0
+                leverage_tag = f"(x{lev:.1f})"
+
             temp_list.append({
-                "raw_code": code, "股票代碼": code, "公司名稱": name,
-                "股數": int(s_val), "成本": c_val, "現價": p_val,
-                "日損益%": change_pct / 100, "日損益": day_profit_val,
-                "總損益%": total_profit_pct / 100, "總損益": total_profit_val,
-                "市值": mkt_val, "mkt_val_raw": mkt_val
+                "raw_code": code, 
+                "股票代碼": code, 
+                "公司名稱": name,
+                "股數": int(s_val), 
+                "成本": c_val, 
+                "現價": p_val,
+                "日損益%": change_pct / 100, 
+                "日損益": day_profit_val,
+                "總損益%": total_profit_pct / 100, # 這裡現在是真實本金報酬率
+                "總損益": total_profit_val,
+                "市值": mkt_val, 
+                "mkt_val_raw": mkt_val,
+                "槓桿": leverage_tag # 隱藏欄位，可自行決定是否顯示
+            })
             })
 
         final_rows = []
