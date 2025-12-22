@@ -4,7 +4,7 @@ import yfinance as yf
 import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -141,32 +141,37 @@ def get_usdtwd():
         return p if p and not pd.isna(p) else 32.5
     except: return 32.5
 
-# --- 新增：取得歷史區間的標的走勢 (強固版) ---
+# --- 修正版：取得歷史區間的標的走勢 (加入緩衝與備援) ---
 @st.cache_data(ttl=3600)
 def get_benchmark_history(ticker, start_date, end_date):
     try:
-        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+        # 1. 緩衝：起始日往前推 7 天，避免因為假日導致抓不到起點
+        safe_start = start_date - timedelta(days=7)
+        
+        data = yf.download(ticker, start=safe_start, end=end_date, progress=False)
+        
+        # 2. 備援：如果指定日期區間抓不到 (空值)，改用 '1y' 抓最近一年
+        if data.empty:
+            data = yf.download(ticker, period='1y', progress=False)
+
         if not data.empty:
-            # 處理 MultiIndex (yfinance 新版特性)
             if isinstance(data.columns, pd.MultiIndex):
-                try:
-                    df = data.xs('Close', level=0, axis=1)
-                except:
-                    df = data['Close'] # 備用方案
+                try: df = data.xs('Close', level=0, axis=1)
+                except: df = data['Close']
             else:
                 df = data[['Close']]
             
-            # 確保是 DataFrame 且只有一欄
             if isinstance(df, pd.Series):
                 df = df.to_frame(name='Close')
             else:
                 df = df[['Close']]
                 
-            # 關鍵修正：移除時區並標準化
             df.index = pd.to_datetime(df.index).normalize()
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
-                
+            
+            # 3. 過濾：只回傳使用者需要的日期區間
+            df = df[df.index >= start_date]
             return df
     except Exception as e: 
         print(f"Benchmark Error: {e}")
@@ -478,14 +483,11 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                     hvals = hs.get_all_values()
                     if len(hvals) > 1:
                         dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
-                        # 關鍵修正：處理日期格式
                         dfh['Date'] = pd.to_datetime(dfh['Date']).dt.normalize()
                         dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
                         dfh = dfh.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
                         dfh = dfh.set_index('Date')
-                        # 確保使用者資料的 Index 是 Naive TimeZone
-                        if dfh.index.tz is not None:
-                            dfh.index = dfh.index.tz_localize(None)
+                        if dfh.index.tz is not None: dfh.index = dfh.index.tz_localize(None)
                         
                         bench_name = st.selectbox("選擇比較標的", list(BENCHMARKS.keys()))
                         bench_ticker = BENCHMARKS[bench_name]
@@ -493,21 +495,16 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                         if not dfh.empty:
                             start_date = dfh.index.min()
                             end_date = datetime.now()
-                            
                             bench_df = get_benchmark_history(bench_ticker, start_date, end_date)
 
                             if bench_df is not None and not bench_df.empty:
-                                # 合併時自動對齊 Index
                                 merged = pd.merge(dfh, bench_df, left_index=True, right_index=True, how='left')
                                 merged['Close'] = merged['Close'].ffill()
-                                
                                 first_asset = merged['NetAsset'].iloc[0]
                                 first_bench = merged['Close'].iloc[0]
-                                
                                 if first_asset > 0 and first_bench > 0 and not pd.isna(first_bench):
                                     merged['User_Growth'] = (merged['NetAsset'] / first_asset - 1) * 100
                                     merged['Bench_Growth'] = (merged['Close'] / first_bench - 1) * 100
-                                    
                                     fig = go.Figure()
                                     fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的資產 ({username})', line=dict(width=3, color='#d62728')))
                                     fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name}', line=dict(width=2, color='gray', dash='dot')))
