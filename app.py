@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家", layout="wide", page_icon="📈")
 
-# --- Google Sheets 連線與資料處理 (已加入自動修復功能) ---
+# --- Google Sheets 連線與資料處理 (含自動修復功能) ---
 def get_google_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -23,11 +23,9 @@ def get_google_client():
         
         # 2. 嘗試解析 (加入容錯機制)
         try:
-            # 第一次嘗試：標準解析
             creds_dict = json.loads(secret_str, strict=False)
         except json.JSONDecodeError:
-            # 3. 如果失敗，這通常是因為 Secrets 裡面的 \n 被轉成了真的換行符號
-            # 我們在這裡用程式碼自動把它修好
+            # 3. 自動修復隱形換行
             fixed_str = secret_str.replace('\n', '\\n').replace('\r', '')
             creds_dict = json.loads(fixed_str, strict=False)
             
@@ -36,7 +34,6 @@ def get_google_client():
         return client
     except Exception as e:
         st.error(f"連線 Google Sheets 失敗: {e}")
-        st.caption("建議檢查 Secrets 設定，確保 service_account_info 包含完整的 JSON 內容。")
         return None
 
 def get_main_sheet(client):
@@ -63,7 +60,7 @@ def load_data(sheet):
         raw_data = sheet.acell('A1').value
         if raw_data:
             data = json.loads(raw_data)
-            # 資料結構升級防呆
+            # 資料結構防呆
             for code in data.get('h', {}):
                 if 'lots' not in data['h'][code]:
                     data['h'][code]['lots'] = [{
@@ -133,11 +130,10 @@ def get_usdtwd():
 # --- 介面開始 ---
 st.title("📈 全功能股票資產管家")
 
-# 初始化狀態 (加入防呆機制)
+# 初始化狀態
 if 'client' not in st.session_state:
     st.session_state.client = get_google_client()
 
-# 修正重點：確保 sheet 變數無論如何都有定義
 if 'sheet' not in st.session_state:
     if st.session_state.client:
         st.session_state.sheet = get_main_sheet(st.session_state.client)
@@ -153,8 +149,8 @@ if 'data' not in st.session_state:
 data = st.session_state.data
 
 if not sheet:
-    st.error("⚠️ 系統偵測到 Google Sheets 連線異常。請檢查上方的錯誤訊息。")
-    st.stop() # 停止執行後續程式碼，避免噴出一大堆錯誤
+    st.error("⚠️ 無法連接 Google Sheets，請檢查 Secrets 設定。")
+    st.stop()
 
 # --- 側邊欄：交易面板 ---
 with st.sidebar:
@@ -339,3 +335,22 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                 st.info("無數據")
 
         with tab3:
+            st.subheader("淨資產歷史走勢")
+            if client:
+                hist_sheet = get_history_sheet(client)
+                if hist_sheet:
+                    hist_data = hist_sheet.get_all_values()
+                    if len(hist_data) > 1:
+                        df_hist = pd.DataFrame(hist_data[1:], columns=hist_data[0])
+                        df_hist['Date'] = pd.to_datetime(df_hist['Date'])
+                        df_hist['NetAsset'] = pd.to_numeric(df_hist['NetAsset'])
+                        df_hist = df_hist.set_index('Date')
+                        fig_line = px.line(df_hist, y='NetAsset', markers=True)
+                        fig_line.update_traces(line_color='#1f77b4', line_width=3)
+                        st.plotly_chart(fig_line, use_container_width=True)
+                    else:
+                        st.info("尚無足夠的歷史紀錄，請持續更新以累積數據。")
+            else:
+                st.error("無法讀取歷史紀錄")
+else:
+    st.info("👆 請點擊更新按鈕")
