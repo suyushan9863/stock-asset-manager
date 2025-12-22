@@ -141,42 +141,45 @@ def get_usdtwd():
         return p if p and not pd.isna(p) else 32.5
     except: return 32.5
 
-# --- 修正版 2.0：取得歷史區間的標的走勢 ---
+# --- 強化版：取得歷史區間的標的走勢 (含自動替補) ---
 @st.cache_data(ttl=3600)
-def get_benchmark_history(ticker, start_date, end_date):
-    try:
-        # 策略 1: 直接抓取較長區間 (1年)，確保一定有資料，然後再切分
-        # 這樣比指定短日期區間 (start=..., end=...) 更穩定
-        data = yf.download(ticker, period="2y", progress=False)
-        
-        if not data.empty:
-            # 處理 MultiIndex
-            if isinstance(data.columns, pd.MultiIndex):
-                try: df = data.xs('Close', level=0, axis=1)
-                except: df = data['Close']
-            else:
-                df = data[['Close']]
-            
-            if isinstance(df, pd.Series):
-                df = df.to_frame(name='Close')
-            else:
-                df = df[['Close']]
+def get_benchmark_history(ticker, start_date):
+    
+    def fetch_data(t):
+        try:
+            # 抓取過去 2 年資料，確保覆蓋 start_date
+            d = yf.download(t, period="2y", progress=False, threads=False)
+            if not d.empty:
+                if isinstance(d.columns, pd.MultiIndex):
+                    try: d = d.xs('Close', level=0, axis=1)
+                    except: d = d['Close']
+                else:
+                    d = d[['Close']]
                 
-            # 移除時區並標準化
-            df.index = pd.to_datetime(df.index).normalize()
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
+                if isinstance(d, pd.Series): d = d.to_frame(name='Close')
+                else: d = d[['Close']]
+                
+                d.index = pd.to_datetime(d.index).normalize()
+                if d.index.tz is not None: d.index = d.index.tz_localize(None)
+                
+                # 過濾日期 (多抓 10 天緩衝)
+                mask = (d.index >= (start_date - timedelta(days=10)))
+                d = d.loc[mask]
+                return d
+        except: pass
+        return None
+
+    # 1. 嘗試抓取指定的標的
+    df = fetch_data(ticker)
+    
+    # 2. 如果是 ^TWII 且失敗，自動嘗試 0050.TW
+    if (df is None or df.empty) and ticker == '^TWII':
+        print("Fallback to 0050.TW")
+        df = fetch_data('0050.TW')
+        if df is not None and not df.empty:
+            return df, True # True 代表使用了替補
             
-            # 根據使用者的起始日進行過濾
-            # 稍微往前多抓幾天避免邊界問題
-            mask = (df.index >= (start_date - timedelta(days=5)))
-            df = df.loc[mask]
-            
-            return df
-    except Exception as e: 
-        print(f"Benchmark Error: {e}")
-        pass
-    return None
+    return df, False
 
 # --- 登入介面 ---
 if 'current_user' not in st.session_state:
@@ -452,7 +455,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         with tab1:
             if final_rows:
                 df = pd.DataFrame(final_rows)
-                # 重新排列欄位順序以符合您的圖片
+                # 介面優化：調整欄位順序與格式
                 cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
                 df = df[cols]
                 styler = df.style.format({
@@ -477,7 +480,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             else: st.info("無數據")
 
         with tab3:
-            st.caption("ℹ️ 此圖表顯示「累計報酬率 (%)」，起點設為 0%。需累積至少兩天資料才會顯示。")
+            st.caption("ℹ️ 此圖表顯示「累計報酬率 (%)」，起點設為 0%。")
             if client:
                 hs = get_user_history_sheet(client, username)
                 if hs:
@@ -495,27 +498,32 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                         
                         if not dfh.empty:
                             start_date = dfh.index.min()
-                            end_date = datetime.now()
-                            # 使用修正後的函式抓取資料
-                            bench_df = get_benchmark_history(bench_ticker, start_date, end_date)
+                            # 強化版抓取邏輯
+                            bench_df, used_proxy = get_benchmark_history(bench_ticker, start_date)
 
                             if bench_df is not None and not bench_df.empty:
+                                if used_proxy:
+                                    st.warning(f"⚠️ 注意：無法取得 {bench_name} ({bench_ticker}) 的資料，系統已自動切換為替代標的 (0050.TW) 以進行趨勢比較。")
+                                    
                                 merged = pd.merge(dfh, bench_df, left_index=True, right_index=True, how='left')
                                 merged['Close'] = merged['Close'].ffill()
-                                first_asset = merged['NetAsset'].iloc[0]
-                                first_bench = merged['Close'].iloc[0]
-                                if first_asset > 0 and first_bench > 0 and not pd.isna(first_bench):
+                                
+                                # 安全計算起始點
+                                first_asset = merged['NetAsset'].dropna().iloc[0] if not merged['NetAsset'].dropna().empty else 0
+                                first_bench = merged['Close'].dropna().iloc[0] if not merged['Close'].dropna().empty else 0
+                                
+                                if first_asset > 0 and first_bench > 0:
                                     merged['User_Growth'] = (merged['NetAsset'] / first_asset - 1) * 100
                                     merged['Bench_Growth'] = (merged['Close'] / first_bench - 1) * 100
                                     fig = go.Figure()
                                     fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的資產 ({username})', line=dict(width=3, color='#d62728')))
-                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name}', line=dict(width=2, color='gray', dash='dot')))
+                                    fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name} (趨勢)', line=dict(width=2, color='gray', dash='dot')))
                                     fig.update_layout(title=f"資產成長 vs {bench_name}", xaxis_title="日期", yaxis_title="累計報酬率 (%)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                                     st.plotly_chart(fig, use_container_width=True)
-                                else: st.warning("⚠️ 無法繪圖：起始日大盤資料缺失，請嘗試手動補齊昨日資料。")
-                            else: st.warning(f"無法取得 {bench_name} 歷史資料 (Yahoo Finance 暫時無回應，請稍後再試)")
+                                else: st.warning("⚠️ 起始日無資料，請檢查 Google Sheets 'Hist' 分頁的日期是否正確。")
+                            else: st.warning(f"無法取得 {bench_name} 歷史資料")
                         else: st.info("尚無歷史資料")
-                    else: st.info("💡 這是新版程式，歷史資料已重置。請每天按一次更新，兩天後就會出現走勢圖。")
+                    else: st.info("💡 歷史資料不足，請手動至 Google Sheets 補上至少一筆過去日期的資料。")
             else: st.error("無法讀取歷史")
 
         with tab4:
