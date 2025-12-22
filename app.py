@@ -23,14 +23,13 @@ STOCK_MAP = {
 
 # --- 比較標的清單 ---
 BENCHMARKS = {
-    '台灣加權指數': '^TWII',
-    '0050 (元大台灣50)': '0050.TW',
+    '台灣加權指數 (以0050代表)': '0050.TW', # 修正：強制用 0050 代表大盤，避免 ^TWII 抓不到
     'S&P 500 (美股大盤)': '^GSPC',
     'QQQ (那斯達克100)': 'QQQ',
     '費城半導體指數': '^SOX'
 }
 
-# --- Google Sheets 連線與資料處理 ---
+# --- Google Sheets 連線 ---
 def get_google_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -141,45 +140,49 @@ def get_usdtwd():
         return p if p and not pd.isna(p) else 32.5
     except: return 32.5
 
-# --- 強化版：取得歷史區間的標的走勢 (含自動替補) ---
+# --- 最終修正版：取得歷史區間的標的走勢 ---
 @st.cache_data(ttl=3600)
 def get_benchmark_history(ticker, start_date):
-    
-    def fetch_data(t):
-        try:
-            # 抓取過去 2 年資料，確保覆蓋 start_date
-            d = yf.download(t, period="2y", progress=False, threads=False)
-            if not d.empty:
-                if isinstance(d.columns, pd.MultiIndex):
-                    try: d = d.xs('Close', level=0, axis=1)
-                    except: d = d['Close']
-                else:
-                    d = d[['Close']]
-                
-                if isinstance(d, pd.Series): d = d.to_frame(name='Close')
-                else: d = d[['Close']]
-                
-                d.index = pd.to_datetime(d.index).normalize()
-                if d.index.tz is not None: d.index = d.index.tz_localize(None)
-                
-                # 過濾日期 (多抓 10 天緩衝)
-                mask = (d.index >= (start_date - timedelta(days=10)))
-                d = d.loc[mask]
-                return d
-        except: pass
-        return None
-
-    # 1. 嘗試抓取指定的標的
-    df = fetch_data(ticker)
-    
-    # 2. 如果是 ^TWII 且失敗，自動嘗試 0050.TW
-    if (df is None or df.empty) and ticker == '^TWII':
-        print("Fallback to 0050.TW")
-        df = fetch_data('0050.TW')
-        if df is not None and not df.empty:
-            return df, True # True 代表使用了替補
+    try:
+        # 1. 直接抓取過去 2 年，不管起始日，確保一定有資料
+        data = yf.download(ticker, period="2y", progress=False)
+        
+        if not data.empty:
+            # 處理 MultiIndex 結構
+            if isinstance(data.columns, pd.MultiIndex):
+                try: df = data.xs('Close', level=0, axis=1)
+                except: df = data['Close']
+            else:
+                df = data[['Close']]
             
-    return df, False
+            # 確保是 DataFrame
+            if isinstance(df, pd.Series): df = df.to_frame(name='Close')
+            else: df = df[['Close']]
+            
+            # 2. 【關鍵修正】強制將 Index 轉為單純的日期物件 (date object)
+            # 這樣可以忽略所有時區、小時、分鐘的差異
+            df.index = pd.to_datetime(df.index).date
+            
+            # 3. 轉回 DataFrame (因為 .date 屬性會讓它變回 Index)
+            df.index.name = 'Date'
+            
+            # 4. 過濾資料：只保留比 start_date (含前幾天緩衝) 還要新的
+            # 先轉 start_date 為 date 物件
+            if isinstance(start_date, datetime) or isinstance(start_date, pd.Timestamp):
+                start_date_obj = start_date.date()
+            else:
+                start_date_obj = start_date # 假設已經是 date
+            
+            safe_start = start_date_obj - timedelta(days=10)
+            
+            # 使用列表推導式進行過濾 (最穩定的方法)
+            df = df[df.index >= safe_start]
+            
+            return df
+    except Exception as e: 
+        print(f"Benchmark Error: {e}")
+        pass
+    return None
 
 # --- 登入介面 ---
 if 'current_user' not in st.session_state:
@@ -455,7 +458,7 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
         with tab1:
             if final_rows:
                 df = pd.DataFrame(final_rows)
-                # 介面優化：調整欄位順序與格式
+                # 重新排列欄位順序以符合您的圖片
                 cols = ['股票代碼', '公司名稱', '股數', '成本', '現價', '日損益%', '日損益', '總損益%', '總損益', '市值', '占比']
                 df = df[cols]
                 styler = df.style.format({
@@ -486,41 +489,44 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
                 if hs:
                     hvals = hs.get_all_values()
                     if len(hvals) > 1:
+                        # 1. 處理使用者歷史資料
                         dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
-                        dfh['Date'] = pd.to_datetime(dfh['Date']).dt.normalize()
+                        # 關鍵：只取日期部分 (YYYY-MM-DD)
+                        dfh['Date'] = pd.to_datetime(dfh['Date']).dt.date
                         dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
                         dfh = dfh.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
                         dfh = dfh.set_index('Date')
-                        if dfh.index.tz is not None: dfh.index = dfh.index.tz_localize(None)
                         
                         bench_name = st.selectbox("選擇比較標的", list(BENCHMARKS.keys()))
                         bench_ticker = BENCHMARKS[bench_name]
                         
                         if not dfh.empty:
-                            start_date = dfh.index.min()
-                            # 強化版抓取邏輯
-                            bench_df, used_proxy = get_benchmark_history(bench_ticker, start_date)
+                            start_date = dfh.index.min() # 這是一個 date 物件
+                            
+                            # 2. 抓取標的資料 (已強制轉為 date index)
+                            bench_df = get_benchmark_history(bench_ticker, start_date)
 
                             if bench_df is not None and not bench_df.empty:
-                                if used_proxy:
-                                    st.warning(f"⚠️ 注意：無法取得 {bench_name} ({bench_ticker}) 的資料，系統已自動切換為替代標的 (0050.TW) 以進行趨勢比較。")
-                                    
+                                # 3. 合併 (現在 index 都是 date 物件，絕對能對齊)
                                 merged = pd.merge(dfh, bench_df, left_index=True, right_index=True, how='left')
                                 merged['Close'] = merged['Close'].ffill()
                                 
-                                # 安全計算起始點
-                                first_asset = merged['NetAsset'].dropna().iloc[0] if not merged['NetAsset'].dropna().empty else 0
-                                first_bench = merged['Close'].dropna().iloc[0] if not merged['Close'].dropna().empty else 0
+                                # 移除空值 (如假日)
+                                merged = merged.dropna()
                                 
-                                if first_asset > 0 and first_bench > 0:
+                                if not merged.empty:
+                                    first_asset = merged['NetAsset'].iloc[0]
+                                    first_bench = merged['Close'].iloc[0]
+                                    
                                     merged['User_Growth'] = (merged['NetAsset'] / first_asset - 1) * 100
                                     merged['Bench_Growth'] = (merged['Close'] / first_bench - 1) * 100
+                                    
                                     fig = go.Figure()
                                     fig.add_trace(go.Scatter(x=merged.index, y=merged['User_Growth'], mode='lines+markers', name=f'我的資產 ({username})', line=dict(width=3, color='#d62728')))
                                     fig.add_trace(go.Scatter(x=merged.index, y=merged['Bench_Growth'], mode='lines', name=f'{bench_name} (趨勢)', line=dict(width=2, color='gray', dash='dot')))
                                     fig.update_layout(title=f"資產成長 vs {bench_name}", xaxis_title="日期", yaxis_title="累計報酬率 (%)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                                     st.plotly_chart(fig, use_container_width=True)
-                                else: st.warning("⚠️ 起始日無資料，請檢查 Google Sheets 'Hist' 分頁的日期是否正確。")
+                                else: st.warning("⚠️ 日期對齊後無資料，請確認 Google Sheets 歷史資料的日期範圍。")
                             else: st.warning(f"無法取得 {bench_name} 歷史資料")
                         else: st.info("尚無歷史資料")
                     else: st.info("💡 歷史資料不足，請手動至 Google Sheets 補上至少一筆過去日期的資料。")
