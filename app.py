@@ -109,27 +109,33 @@ with st.sidebar:
 # 主畫面：報表
 st.subheader("資產總覽")
 
-# 這裡需要即時運算，這在網頁版可能會花一點時間
+# 這裡需要運算，這在網頁版可能會花一點時間
 if st.button("🔄 更新即時股價"):
     with st.spinner('正在抓取最新股價...'):
         usdtwd = get_usdtwd()
-        total_mkt_val = 0
-        total_cost_val = 0
+        total_mkt_val = 0.0
+        total_cost_val = 0.0
         
         table_rows = []
         
         h = data.get('h', {})
-        # 刪除功能
-        del_list = []
         
         for code, info in h.items():
             cur_p = get_price(code)
-            if cur_p is None: cur_p = info['c'] # 抓不到就用成本
+            
+            # --- 修正點 1：加強防呆，如果抓到 NaN (無效數值) 就用成本價 ---
+            if cur_p is None or pd.isna(cur_p): 
+                cur_p = info['c'] 
             
             rate = 1.0 if '.TW' in code else usdtwd
             
-            mkt_val = cur_p * info['s'] * rate
-            cost_val = info['c'] * info['s'] * rate
+            # 確保運算數值為 float
+            s_val = float(info['s'])
+            c_val = float(info['c'])
+            p_val = float(cur_p)
+            
+            mkt_val = p_val * s_val * rate
+            cost_val = c_val * s_val * rate
             profit = mkt_val - cost_val
             profit_pct = (profit / cost_val * 100) if cost_val else 0
             
@@ -138,9 +144,9 @@ if st.button("🔄 更新即時股價"):
             
             table_rows.append({
                 "代碼": code,
-                "股數": info['s'],
-                "成本": f"{info['c']:.2f}",
-                "現價": f"{cur_p:.2f}",
+                "股數": int(s_val),
+                "成本": f"{c_val:.2f}",
+                "現價": f"{p_val:.2f}",
                 "市值 (TWD)": int(mkt_val),
                 "損益 (TWD)": int(profit),
                 "報酬率 %": f"{profit_pct:+.2f}%"
@@ -149,26 +155,29 @@ if st.button("🔄 更新即時股價"):
         net_asset = total_mkt_val + data['cash']
         total_profit = total_mkt_val - total_cost_val
         
-        # 顯示 KPI
+        # --- 修正點 2：移除 delta_color 參數避免警告，並確保 total_profit 為數字 ---
         col1, col2, col3 = st.columns(3)
         col1.metric("淨資產總額", f"${int(net_asset):,}")
         col2.metric("證券市值", f"${int(total_mkt_val):,}")
-        col3.metric("未實現損益", f"${int(total_profit):,+}", delta_color="normal")
+        
+        # 這裡加強檢查，如果 total_profit 是無效的，就顯示 0
+        safe_profit = int(total_profit) if not pd.isna(total_profit) else 0
+        col3.metric("未實現損益", f"${safe_profit:+,}")
         
         # 顯示表格
         if table_rows:
             df = pd.DataFrame(table_rows)
             st.dataframe(df, use_container_width=True)
             
-            # 刪除邏輯 (簡易版)
+            # 刪除邏輯
             st.markdown("---")
             st.subheader("庫存管理")
             to_del = st.selectbox("選擇要刪除的股票", ["請選擇"] + list(h.keys()))
             if to_del != "請選擇":
                 if st.button(f"確定刪除 {to_del} (退回現金)"):
                     # 退回現金邏輯
-                    shares = h[to_del]['s']
-                    cost = h[to_del]['c']
+                    shares = float(h[to_del]['s'])
+                    cost = float(h[to_del]['c'])
                     rate = 1.0 if '.TW' in to_del else usdtwd
                     refund = shares * cost * rate
                     data['cash'] += refund
@@ -176,9 +185,6 @@ if st.button("🔄 更新即時股價"):
                     save_data(data)
                     st.success("已刪除並退回本金")
                     st.rerun()
-
-else:
-    st.info("請點擊上方按鈕以更新最新報價")
 
 # JSON 檢視 (除錯用)
 with st.expander("查看原始資料 (JSON)"):
