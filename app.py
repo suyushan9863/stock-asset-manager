@@ -4,12 +4,12 @@ import yfinance as yf
 import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 
 # 設定頁面配置
-st.set_page_config(page_title="全功能資產管家", layout="wide", page_icon="📈")
+st.set_page_config(page_title="全功能資產管家 Pro", layout="wide", page_icon="📈")
 
 # --- 股票代碼與名稱對照表 ---
 STOCK_MAP = {
@@ -18,7 +18,8 @@ STOCK_MAP = {
     '3231.TW': '緯創', '2382.TW': '廣達', '3017.TW': '奇鋐',
     '2301.TW': '光寶科', '00685L.TW': '群益台指正2', '00670L.TW': '元大NASDAQ正2',
     'NVDA': '輝達', 'AAPL': '蘋果', 'TSLA': '特斯拉', 'AMD': '超微',
-    'MSFT': '微軟', 'GOOG': '谷歌', 'AMZN': '亞馬遜'
+    'MSFT': '微軟', 'GOOG': '谷歌', 'AMZN': '亞馬遜',
+    '0050.TW': '元大台灣50', 'SPY': 'S&P 500', 'QQQ': '納斯達克100'
 }
 
 # --- Google Sheets 連線與資料處理 ---
@@ -26,12 +27,7 @@ def get_google_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         secret_str = st.secrets["service_account_info"]
-        creds_dict = None
-        try:
-            creds_dict = json.loads(secret_str, strict=False)
-        except json.JSONDecodeError:
-            fixed_str = secret_str.replace('\n', '\\n').replace('\r', '')
-            creds_dict = json.loads(fixed_str, strict=False)
+        creds_dict = json.loads(secret_str, strict=False) if isinstance(secret_str, str) else secret_str
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         return client
@@ -61,13 +57,15 @@ def get_user_history_sheet(client, username):
         try:
             history_sheet = spreadsheet.worksheet(worksheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            history_sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols="2")
-            history_sheet.append_row(['Date', 'NetAsset'])
+            history_sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols="3")
+            # [修改] 增加 Principal 欄位
+            history_sheet.append_row(['Date', 'NetAsset', 'Principal'])
         return history_sheet
     except: return None
 
 def load_data(sheet):
-    default_data = {'h': {}, 'cash': 0.0, 'history': []}
+    # [修改] 預設結構增加 'principal' (投入本金)
+    default_data = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': []}
     if not sheet: return default_data
     try:
         raw_data = sheet.acell('A1').value
@@ -76,6 +74,10 @@ def load_data(sheet):
             if 'h' not in data: data['h'] = {}
             if 'cash' not in data: data['cash'] = 0.0
             if 'history' not in data: data['history'] = []
+            # 如果舊資料沒有 principal，暫時假設 principal = cash (初始狀態)
+            if 'principal' not in data: data['principal'] = data.get('cash', 0.0) 
+            
+            # 資料清洗：確保 lots 結構完整
             for code in data.get('h', {}):
                 if 'lots' not in data['h'][code]:
                     data['h'][code]['lots'] = [{
@@ -92,65 +94,148 @@ def save_data(sheet, data):
             sheet.update_acell('A1', json_str)
         except Exception as e: st.error(f"存檔失敗: {e}")
 
-def record_history(client, username, net_asset):
+# [修改] 紀錄歷史時，同時記錄當下的本金 (Principal)
+def record_history(client, username, net_asset, current_principal):
     hist_sheet = get_user_history_sheet(client, username)
     if hist_sheet and net_asset > 0:
         today = datetime.now().strftime('%Y-%m-%d')
         try:
             all_values = hist_sheet.get_all_values()
+            # 確保標題列正確
+            if len(all_values) > 0 and len(all_values[0]) < 3:
+                 hist_sheet.update_cell(1, 3, 'Principal')
+
             if len(all_values) > 1:
                 last_row = all_values[-1]
                 if last_row[0] == today:
                     row_index = len(all_values)
                     hist_sheet.update_cell(row_index, 2, int(net_asset))
+                    hist_sheet.update_cell(row_index, 3, int(current_principal))
                     return
         except: pass
-        hist_sheet.append_row([today, int(net_asset)])
+        hist_sheet.append_row([today, int(net_asset), int(current_principal)])
 
-# --- 核心計算邏輯 ---
-@st.cache_data(ttl=60)
-def get_price_data(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period='2d')
-        if len(hist) >= 1:
-            price = hist['Close'].iloc[-1]
-            prev_close = hist['Close'].iloc[-2] if len(hist) >= 2 else price
-            change_val = price - prev_close
-            change_pct = (change_val / prev_close * 100) if prev_close else 0
-            return price, change_val, change_pct
-        
-        price = stock.fast_info.get('last_price')
-        if price and not pd.isna(price):
-             prev = stock.info.get('previousClose', price)
-             change_val = price - prev
-             change_pct = (change_val / prev * 100) if prev else 0
-             return price, change_val, change_pct
-        return None, 0, 0
-    except: return None, 0, 0
+# --- 核心計算邏輯 (優化版) ---
 
 @st.cache_data(ttl=300)
 def get_usdtwd():
     try:
-        fx = yf.Ticker('USDTWD=X')
-        p = fx.fast_info.get('last_price')
-        return p if p and not pd.isna(p) else 32.5
+        # 嘗試下載
+        data = yf.download("USDTWD=X", period="1d", progress=False)
+        if not data.empty:
+            # 處理新版 yfinance 回傳格式
+            p = data['Close'].iloc[-1]
+            if isinstance(p, pd.Series): p = p.iloc[0]
+            return float(p)
+        return 32.5
     except: return 32.5
 
-# --- 登入介面 ---
+# [新增] 建議一：批量報價抓取
+@st.cache_data(ttl=60)
+def get_batch_market_data(codes, usdtwd_rate):
+    if not codes: return {}
+    
+    # 分離台股與美股
+    tw_stocks = [c for c in codes if '.TW' in c or '.TWO' in c]
+    us_stocks = [c for c in codes if c not in tw_stocks]
+    all_tickers = tw_stocks + us_stocks
+    
+    results = {}
+    if not all_tickers: return {}
+
+    try:
+        # 下載數據 (group_by='ticker' 讓結構更清晰)
+        df = yf.download(all_tickers, period="5d", group_by='ticker', threads=True, progress=False)
+        
+        for code in all_tickers:
+            try:
+                # 處理單一股票或多股票返回結構的差異
+                hist = df if len(all_tickers) == 1 else df[code]
+                
+                # 檢查是否為空
+                if hist.empty or 'Close' not in hist.columns:
+                    results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+                    continue
+
+                # 取得最新收盤價 (去除 NaN)
+                hist_clean = hist['Close'].dropna()
+                if hist_clean.empty:
+                    results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+                    continue
+                
+                price = float(hist_clean.iloc[-1])
+                
+                # 取得前一日價格 (如果資料不足2筆，用當日開盤或現價代替)
+                prev_close = price
+                if len(hist_clean) >= 2:
+                    prev_close = float(hist_clean.iloc[-2])
+                elif 'Open' in hist.columns:
+                    first_open = hist['Open'].dropna().iloc[-1]
+                    prev_close = float(first_open)
+                
+                change_val = price - prev_close
+                change_pct = (change_val / prev_close * 100) if prev_close != 0 else 0
+                
+                results[code] = {
+                    'p': price,
+                    'chg': change_val,
+                    'chg_pct': change_pct
+                }
+            except Exception as e:
+                # print(f"Error parsing {code}: {e}")
+                results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+                
+    except Exception as e:
+        st.error(f"批量抓取失敗: {e}")
+        
+    return results
+
+# [新增] 獲取基準指數歷史數據 (用於比較)
+@st.cache_data(ttl=3600)
+def get_benchmark_data(start_date):
+    tickers = ['0050.TW', 'SPY', 'QQQ']
+    try:
+        # yfinance 需要日期格式 YYYY-MM-DD
+        df = yf.download(tickers, start=start_date, group_by='ticker', progress=False)
+        benchmarks = {}
+        for t in tickers:
+            if len(tickers) == 1: sub_df = df
+            else: sub_df = df[t]
+            
+            if 'Close' in sub_df.columns:
+                series = sub_df['Close'].dropna()
+                # 歸一化：以第一天為基準計算漲跌幅
+                if not series.empty:
+                    start_val = series.iloc[0]
+                    if start_val > 0:
+                        benchmarks[t] = ((series / start_val) - 1) * 100
+        return benchmarks
+    except: return {}
+
+# --- 登入介面 (包含密碼驗證) ---
 if 'current_user' not in st.session_state:
     st.session_state.current_user = None
 
 if not st.session_state.current_user:
-    st.markdown("<h1 style='text-align: center;'>🔐 股票資產管家</h1>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        user_input = st.text_input("使用者名稱 (例如: Kevin)", key="login_input")
-        if st.button("登入 / 註冊", use_container_width=True):
-            if user_input.strip():
-                st.session_state.current_user = user_input.strip()
-                st.rerun()
-            else: st.error("請輸入名稱")
+    st.markdown("<h1 style='text-align: center;'>🔐 股票資產管家 Pro</h1>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1,2,1])
+    with c2:
+        with st.form("login_form"):
+            user_input = st.text_input("使用者名稱 (例如: Kevin)")
+            # [新增] 密碼欄位
+            pwd_input = st.text_input("密碼", type="password")
+            submit = st.form_submit_button("登入", use_container_width=True)
+            
+            if submit:
+                # 讀取 secrets 中的密碼設定
+                users_db = st.secrets.get("passwords", {})
+                
+                if user_input in users_db and str(users_db[user_input]) == str(pwd_input):
+                    st.session_state.current_user = user_input
+                    st.success("登入成功！")
+                    st.rerun()
+                else:
+                    st.error("帳號或密碼錯誤 (若是首次使用請聯絡管理員設定)")
     st.stop()
 
 # --- 主程式 ---
@@ -183,14 +268,20 @@ if not sheet:
 
 st.title(f"📈 資產管家 - {username}")
 
-# --- 側邊欄 ---
+# --- 側邊欄：資金與下單 ---
 with st.sidebar:
     st.header("💰 資金與交易")
     st.metric("現金餘額", f"${int(data.get('cash', 0)):,}")
-    with st.expander("💵 資金存提"):
+    
+    # [修改] 建議二：存提款會影響 Principal
+    with st.expander("💵 資金存提 (影響本金)"):
         cash_op = st.number_input("金額 (正存/負提)", step=1000.0)
         if st.button("執行異動"):
             data['cash'] += cash_op
+            # 更新本金紀錄
+            if 'principal' not in data: data['principal'] = 0.0
+            data['principal'] += cash_op 
+            
             save_data(sheet, data)
             st.success("資金已更新"); st.rerun()
 
@@ -294,45 +385,34 @@ with st.sidebar:
                     st.success(f"賣出成功"); st.balloons(); st.rerun()
 
     st.markdown("---")
-
-    with st.expander("🔧 庫存修正/刪除"):
-        st.warning("⚠️ 僅用於輸入錯誤修正，會退回自備款。")
+    with st.expander("🔧 修正/刪除"):
         del_list = list(data.get('h', {}).keys())
         if del_list:
-            to_del_code = st.selectbox("刪除代碼", ["請選擇"] + del_list, key="force_del_select")
-            if to_del_code != "請選擇":
-                if st.button(f"強制刪除 {to_del_code}"):
-                    t_back = 0
-                    is_tw = ('.TW' in to_del_code or '.TWO' in to_del_code)
-                    rate = 1.0 if is_tw else get_usdtwd()
-                    for l in data['h'][to_del_code].get('lots', []):
-                        cost_t = l['p'] * l['s'] * rate
-                        debt = l.get('debt', 0)
-                        t_back += (cost_t - debt)
-                    data['cash'] += t_back
-                    del data['h'][to_del_code]
-                    save_data(sheet, data)
-                    st.success(f"已刪除 {to_del_code}"); st.rerun()
-        else: st.info("無資料")
-
+            to_del_code = st.selectbox("刪除", ["請選擇"] + del_list)
+            if to_del_code != "請選擇" and st.button("強制刪除"):
+                del data['h'][to_del_code]
+                save_data(sheet, data)
+                st.rerun()
 
 # --- 主畫面更新 ---
-if st.button("🔄 更新即時報價與走勢", type="primary", use_container_width=True):
-    with st.spinner('正在連線交易所抓取最新數據...'):
+if st.button("🔄 更新即時報價 (極速版)", type="primary", use_container_width=True):
+    with st.spinner('正在同步市場數據...'):
         usdtwd = get_usdtwd()
         h = data.get('h', {})
+        
+        # [修改] 建議一：使用 Batch Fetching
+        batch_prices = get_batch_market_data(list(h.keys()), usdtwd)
         
         temp_list = []
         total_mkt_val = 0.0
         total_cost_val = 0.0
         total_debt = 0.0
         total_day_profit = 0.0
-        agg_profit_for_roi = 0.0
-        agg_principal_for_roi = 0.0
-
+        
+        # 遍歷持股計算 (此處不再呼叫 API)
         for code, info in h.items():
-            cur_p, change_val, change_pct = get_price_data(code)
-            if cur_p is None or pd.isna(cur_p): cur_p = info['c']
+            market_info = batch_prices.get(code, {'p': info['c'], 'chg': 0, 'chg_pct': 0})
+            cur_p = market_info['p'] if market_info['p'] > 0 else info['c']
             
             rate = 1.0 if ('.TW' in code or '.TWO' in code) else usdtwd
             s_val = float(info['s'])
@@ -347,20 +427,18 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             total_profit_val = mkt_val - cost_val
             total_profit_pct = (total_profit_val / actual_principal * 100) if actual_principal > 0 else 0
             
-            day_profit_val = change_val * s_val * rate
+            day_profit_val = market_info['chg'] * s_val * rate
             total_day_profit += day_profit_val
             
             total_mkt_val += mkt_val
             total_cost_val += cost_val
             total_debt += stock_debt
-            agg_profit_for_roi += total_profit_val
-            agg_principal_for_roi += actual_principal
 
             name = STOCK_MAP.get(code, code)
             temp_list.append({
                 "raw_code": code, "股票代碼": code, "公司名稱": name,
                 "股數": int(s_val), "成本": c_val, "現價": p_val,
-                "日損益%": change_pct / 100, "日損益": day_profit_val,
+                "日損益%": market_info['chg_pct'] / 100, "日損益": day_profit_val,
                 "總損益%": total_profit_pct / 100, "總損益": total_profit_val,
                 "市值": mkt_val, "mkt_val_raw": mkt_val
             })
@@ -373,37 +451,35 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
 
         net_asset = (total_mkt_val + data['cash']) - total_debt
         unrealized_profit = total_mkt_val - total_cost_val
-        if client: record_history(client, username, net_asset)
+        
+        # [修改] 紀錄歷史時帶入 Principal
+        current_principal = data.get('principal', data['cash'])
+        if client: record_history(client, username, net_asset, current_principal)
 
-        total_realized_profit = 0
-        total_realized_cost = 0
-        for r in data.get('history', []):
-            total_realized_profit += r.get('profit', 0)
-            total_realized_cost += r.get('buy_cost', 0)
-
-        total_unrealized_roi = (agg_profit_for_roi / agg_principal_for_roi * 100) if agg_principal_for_roi > 0 else 0
-        yesterday_mkt_val = total_mkt_val - total_day_profit
-        total_day_roi = (total_day_profit / yesterday_mkt_val * 100) if yesterday_mkt_val > 0 else 0
-        total_realized_roi = (total_realized_profit / total_realized_cost * 100) if total_realized_cost > 0 else 0
-        grand_total_profit = unrealized_profit + total_realized_profit
-        grand_total_principal = agg_principal_for_roi + total_realized_cost
-        grand_total_roi = (grand_total_profit / grand_total_principal * 100) if grand_total_principal > 0 else 0
+        # 計算 ROI 指標
+        total_realized_profit = sum(r.get('profit', 0) for r in data.get('history', []))
+        total_realized_cost = sum(r.get('buy_cost', 0) for r in data.get('history', []))
+        
+        # 使用本金計算總體回報 (Net Asset - Principal) / Principal
+        roi_basis = current_principal if current_principal > 0 else 1
+        total_roi_pct = ((net_asset - current_principal) / roi_basis) * 100
 
         st.subheader("🏦 資產概況")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("💰 淨資產", f"${int(net_asset):,}")
         k2.metric("💵 現金餘額", f"${int(data.get('cash', 0)):,}")
         k3.metric("📊 證券市值", f"${int(total_mkt_val):,}")
-        k4.metric("💸 融資負債", f"${int(total_debt):,}", delta_color="inverse")
+        k4.metric("📉 投入本金", f"${int(current_principal):,}") # 顯示本金
         st.markdown("---")
+        
         st.subheader("📈 績效表現")
         kp1, kp2, kp3, kp4 = st.columns(4)
-        kp1.metric("📅 今日損益", f"${int(total_day_profit):+,}", delta=f"{total_day_roi:+.2f}%")
-        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}", delta=f"{total_unrealized_roi:+.2f}% (槓桿)")
-        kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}", delta=f"{total_realized_roi:+.2f}%")
-        kp4.metric("🏆 總合損益", f"${int(grand_total_profit):+,}", delta=f"{grand_total_roi:+.2f}%")
+        kp1.metric("📅 今日損益", f"${int(total_day_profit):+,}")
+        kp2.metric("📄 未實現損益", f"${int(unrealized_profit):+,}")
+        kp3.metric("💰 已實現損益", f"${int(total_realized_profit):+,}")
+        kp4.metric("🏆 總資產報酬率 (ROI)", f"{total_roi_pct:+.2f}%", help="計算公式: (淨資產 - 投入本金) / 投入本金")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📈 淨資產報酬率", "📜 已實現損益"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
         def color_profit(val):
             color = 'red' if val > 0 else 'green' if val < 0 else 'black'
             return f'color: {color}'
@@ -435,45 +511,65 @@ if st.button("🔄 更新即時報價與走勢", type="primary", use_container_w
             else: st.info("無數據")
 
         with tab3:
-            st.caption("ℹ️ 此圖顯示您的「累計報酬率 (%)」，起點為 0%。這能更直觀地看出資產增長的幅度。")
+            st.caption("ℹ️ 此圖顯示您的「淨資產報酬率」與大盤比較 (已排除入金影響)")
             if client:
                 hs = get_user_history_sheet(client, username)
                 if hs:
                     hvals = hs.get_all_values()
                     if len(hvals) > 1:
-                        dfh = pd.DataFrame(hvals[1:], columns=hvals[0])
+                        # 處理標題列可能變動的情況
+                        headers = hvals[0]
+                        dfh = pd.DataFrame(hvals[1:], columns=headers)
                         dfh['Date'] = pd.to_datetime(dfh['Date'])
                         dfh['NetAsset'] = pd.to_numeric(dfh['NetAsset'])
+                        
+                        # 相容性處理：如果舊資料沒有 Principal，設為 NetAsset 的初始值或 0
+                        if 'Principal' in dfh.columns:
+                            dfh['Principal'] = pd.to_numeric(dfh['Principal'])
+                        else:
+                            # 舊資料回補：假設報酬率為 0 (Principal = NetAsset)
+                            dfh['Principal'] = dfh['NetAsset'] 
+
                         dfh = dfh.sort_values('Date')
                         
-                        # --- 關鍵修改：歸一化計算 (計算成長百分比) ---
-                        first_val = dfh['NetAsset'].iloc[0]
-                        if first_val > 0:
-                            dfh['Growth'] = (dfh['NetAsset'] / first_val - 1) * 100
-                            
-                            # 繪圖
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(
-                                x=dfh['Date'], 
-                                y=dfh['Growth'],
-                                mode='lines+markers',
-                                name='累計報酬率',
-                                line=dict(color='#d62728', width=3),
-                                customdata=dfh['NetAsset'], # 把淨值藏在 customdata 裡
-                                hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<br><b>淨資產</b>: $%{customdata:,}<extra></extra>'
-                            ))
-                            
-                            fig.update_layout(
-                                title=f"資產成長走勢 ({username})",
-                                xaxis_title="日期",
-                                yaxis_title="累計報酬率 (%)",
-                                hovermode="x unified",
-                                yaxis=dict(tickformat=".2f", ticksuffix="%")
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            st.warning("起始淨資產為 0，無法計算成長率。")
-                    else: st.info("歷史資料不足 (尚未累積數據)")
+                        # [修改] 建議二：正確的 ROI 計算 ( (淨值 - 本金) / 本金 )
+                        # 避免分母為 0
+                        dfh['Principal'] = dfh['Principal'].replace(0, 1)
+                        dfh['ROI'] = (dfh['NetAsset'] - dfh['Principal']) / dfh['Principal'] * 100
+                        
+                        fig = go.Figure()
+                        # 使用者曲線
+                        fig.add_trace(go.Scatter(
+                            x=dfh['Date'], y=dfh['ROI'],
+                            mode='lines+markers', name='我的投資組合',
+                            line=dict(color='#d62728', width=3),
+                            hovertemplate='<b>日期</b>: %{x|%Y-%m-%d}<br><b>報酬率</b>: %{y:.2f}%<extra></extra>'
+                        ))
+
+                        # [新增] 建議四：加入 Benchmark (SPY, 0050, QQQ)
+                        if not dfh.empty:
+                            start_date = dfh['Date'].min().strftime('%Y-%m-%d')
+                            benchmarks = get_benchmark_data(start_date)
+                            colors = {'0050.TW': 'blue', 'SPY': 'green', 'QQQ': 'purple'}
+                            for name, series in benchmarks.items():
+                                # 篩選日期範圍以匹配使用者
+                                aligned_series = series[series.index >= dfh['Date'].min()]
+                                fig.add_trace(go.Scatter(
+                                    x=aligned_series.index, y=aligned_series.values,
+                                    mode='lines', name=name,
+                                    line=dict(color=colors.get(name, 'gray'), width=1, dash='dot'),
+                                    hovertemplate=f'<b>{name}</b>: %{{y:.2f}}%<extra></extra>'
+                                ))
+
+                        fig.update_layout(
+                            title=f"累計報酬率走勢 vs 大盤",
+                            xaxis_title="日期", yaxis_title="累計報酬率 (%)",
+                            hovermode="x unified",
+                            yaxis=dict(tickformat=".2f", ticksuffix="%"),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else: st.info("尚無歷史資料")
             else: st.error("無法讀取歷史")
 
         with tab4:
