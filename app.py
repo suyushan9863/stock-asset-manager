@@ -131,8 +131,13 @@ st.title("📈 全功能股票資產管家")
 # 初始化狀態
 if 'client' not in st.session_state:
     st.session_state.client = get_google_client()
-if 'sheet' not in st.session_state and st.session_state.client:
-    st.session_state.sheet = get_main_sheet(st.session_state.client)
+
+# 修正：無論 client 是否連線成功，都要初始化 sheet 變數，避免後面報錯
+if 'sheet' not in st.session_state:
+    if st.session_state.client:
+        st.session_state.sheet = get_main_sheet(st.session_state.client)
+    else:
+        st.session_state.sheet = None
 
 client = st.session_state.client
 sheet = st.session_state.sheet
