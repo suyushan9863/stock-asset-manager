@@ -113,7 +113,7 @@ def record_history(client, username, net_asset, current_principal):
         except: pass
         hist_sheet.append_row([today, int(net_asset), int(current_principal)])
 
-# --- 核心計算邏輯 ---
+# --- 核心計算邏輯 (修正版) ---
 
 @st.cache_data(ttl=300)
 def get_usdtwd():
@@ -126,45 +126,47 @@ def get_usdtwd():
         return 32.5
     except: return 32.5
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def get_batch_market_data(codes, usdtwd_rate):
+    """
+    修正版：使用 yf.Tickers + fast_info 獲取更準確的「日損益」
+    避免因為 download 歷史資料延遲而導致日損益計算成昨天的漲跌
+    """
     if not codes: return {}
     
-    tw_stocks = [c for c in codes if '.TW' in c or '.TWO' in c]
-    us_stocks = [c for c in codes if c not in tw_stocks]
-    all_tickers = tw_stocks + us_stocks
-    
     results = {}
-    if not all_tickers: return {}
-
+    
     try:
-        df = yf.download(all_tickers, period="5d", group_by='ticker', threads=True, progress=False)
+        # 使用 Tickers 一次建立所有物件
+        tickers = yf.Tickers(' '.join(codes))
         
-        for code in all_tickers:
+        for code in codes:
             try:
-                hist = df if len(all_tickers) == 1 else df[code]
-                if hist.empty or 'Close' not in hist.columns:
-                    results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
-                    continue
-
-                hist_clean = hist['Close'].dropna()
-                if hist_clean.empty:
-                    results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
-                    continue
+                # 取得特定代碼的 Ticker 物件
+                t = tickers.tickers[code]
                 
-                price = float(hist_clean.iloc[-1])
-                prev_close = price
-                if len(hist_clean) >= 2:
-                    prev_close = float(hist_clean.iloc[-2])
-                elif 'Open' in hist.columns:
-                    first_open = hist['Open'].dropna().iloc[-1]
-                    prev_close = float(first_open)
+                # 使用 fast_info 讀取即時與昨日資訊
+                # last_price: 最新成交價
+                # previous_close: 昨日正式收盤價
+                price = t.fast_info.get('last_price', 0)
+                prev_close = t.fast_info.get('previous_close', 0)
                 
-                change_val = price - prev_close
-                change_pct = (change_val / prev_close * 100) if prev_close != 0 else 0
+                # 如果讀取失敗 (例如有些冷門股或剛開盤)，嘗試 fallback 到 0
+                if price is None: price = 0
+                if prev_close is None: prev_close = 0
+                
+                if price > 0 and prev_close > 0:
+                    change_val = price - prev_close
+                    change_pct = (change_val / prev_close * 100)
+                else:
+                    change_val = 0
+                    change_pct = 0
                 
                 results[code] = {'p': price, 'chg': change_val, 'chg_pct': change_pct}
-            except:
+                
+            except Exception as e:
+                # 若單檔失敗，回傳 0 避免當機
+                # print(f"Error fetching {code}: {e}")
                 results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
                 
     except Exception as e:
@@ -466,7 +468,7 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
             'temp_list': temp_list
         }
 
-# --- 顯示層 (移出 button 區塊，只要有資料就顯示) ---
+# --- 顯示層 ---
 if st.session_state.dashboard_data:
     # 從 state 取出資料
     d = st.session_state.dashboard_data
