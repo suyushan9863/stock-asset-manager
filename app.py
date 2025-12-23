@@ -1,13 +1,18 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import twstock
+import requests # 新增 requests 用於手動抓取
+import time
 import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
+import urllib3
+
+# 忽略 SSL 警告 (解決 Streamlit Cloud 連線證交所失敗的問題)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家 Pro", layout="wide", page_icon="📈")
@@ -114,7 +119,7 @@ def record_history(client, username, net_asset, current_principal):
         except: pass
         hist_sheet.append_row([today, int(net_asset), int(current_principal)])
 
-# --- 核心計算邏輯 (即時報價引擎) ---
+# --- 核心計算邏輯 (混合引擎 + SSL修復) ---
 
 @st.cache_data(ttl=300)
 def get_usdtwd():
@@ -127,113 +132,126 @@ def get_usdtwd():
         return 32.5
     except: return 32.5
 
-@st.cache_data(ttl=10) # 縮短快取時間以確保即時性
-def get_batch_market_data(codes, usdtwd_rate):
+def fetch_twse_realtime(codes):
     """
-    混合雙引擎抓價：
-    1. 台股 (.TW) -> 使用 twstock 抓取證交所即時資料 (無延遲)
-    2. 美股/其他 -> 使用 yfinance (Yahoo)
+    手動連線證交所 API，並強制 verify=False 繞過 SSL 錯誤。
+    取代 twstock 套件以解決 Streamlit Cloud 連線問題。
     """
     if not codes: return {}
     
-    results = {}
-    tw_codes_raw = [] # 存 2330 (去尾)
-    tw_codes_map = {} # 存 2330 -> 2330.TW (對照回原本代碼)
-    other_codes = []  # 美股
-
+    # 1. 組合查詢字串 (tse_2330.tw|otc_8271.tw)
+    query_parts = []
     for c in codes:
         if '.TW' in c:
-            # twstock 只需要數字代號 (例如 '2330')
+            # 上市
             raw = c.replace('.TW', '')
-            tw_codes_raw.append(raw)
-            tw_codes_map[raw] = c
-        # 上櫃股票處理 (twstock 也支援上櫃，但要確保代號正確)
+            query_parts.append(f"tse_{raw}.tw")
         elif '.TWO' in c:
+            # 上櫃
             raw = c.replace('.TWO', '')
-            tw_codes_raw.append(raw)
-            tw_codes_map[raw] = c
-        else:
-            other_codes.append(c)
-
-    # --- 引擎 1: 台股 (twstock) ---
-    if tw_codes_raw:
-        try:
-            # 批量抓取證交所即時資料
-            stock_data = twstock.realtime.get(tw_codes_raw)
-            
-            for code_raw, data in stock_data.items():
-                original_code = tw_codes_map.get(code_raw, code_raw + '.TW')
-                
-                if data['success']:
-                    # 嘗試取得最新成交價，若無成交則取最佳買賣價
-                    price_str = data['realtime'].get('latest_trade_price', '-')
-                    if price_str == '-' or not price_str:
-                         price_str = data['realtime'].get('best_bid_price', ['0'])[0]
-                    
-                    try:
-                        price = float(price_str)
-                    except:
-                        price = 0.0
-
-                    # 取得開盤參考價或昨日收盤 (用來算漲跌)
-                    # twstock 的 info 裡通常有 previous_close 不過有時會缺
-                    # 這裡改用 (最新價 - 價差) 來反推，或者直接信任 twstock 的 range
-                    # 簡單作法：直接拿 (最新價 - 開盤價) 當參考? 不對，要跟昨收比
-                    # 幸好 twstock 的 realtime 資料通常有 'high', 'low', 'open' 但沒有明確的 'change'
-                    # 我們改用 yfinance 補昨日收盤價? 不，這樣又會慢。
-                    # twstock 回傳的 info 欄位通常比較空。
-                    # 替代方案：twstock 有直接算好的 diff (漲跌價)嗎？沒有。
-                    # 我們這裡暫時假設：如果 twstock 沒有給昨收，我們用 (Price) - (Price / (1 + range/100)) ? 也不準
-                    # 改良：如果 twstock 成功，我們至少確保了「現價」是即時的。
-                    # 漲跌幅部分：盡量抓。
-                    
-                    # 為了算漲跌，我們還是需要「昨日收盤」。
-                    # 這裡做一個妥協：昨日收盤價不太會變，我們可以用 yfinance 抓昨日收盤(快取很久)，
-                    # 然後用 twstock 的即時價減去 yfinance 的昨收。
-                    
-                    results[original_code] = {'p': price, 'realtime': True} 
-                else:
-                    results[original_code] = {'p': 0, 'realtime': False}
-        except Exception as e:
-            st.error(f"台股即時連線失敗: {e}")
-
-    # --- 引擎 2: 美股 (yfinance) + 補充台股昨收 ---
-    # 我們還是呼叫一次 yfinance 來補美股資料 + 台股的昨日收盤價 (用來算精準漲跌)
-    all_query = tw_codes_map.values() if tw_codes_raw else []
-    all_query = list(all_query) + other_codes
+            query_parts.append(f"otc_{raw}.tw")
     
-    if all_query:
-        try:
-            # 這裡我們只關心 Close (用來做昨收) 和美股的現價
-            yf_data = yf.download(all_query, period="5d", group_by='ticker', progress=False, auto_adjust=False)
-            
-            for code in all_query:
+    if not query_parts: return {}
+    
+    query_str = "|".join(query_parts)
+    timestamp = int(time.time() * 1000)
+    url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={query_str}&json=1&delay=0&_={timestamp}"
+    
+    results = {}
+    try:
+        # 關鍵：verify=False 忽略憑證錯誤
+        response = requests.get(url, verify=False, timeout=5)
+        data = response.json()
+        
+        if 'msgArray' in data:
+            for item in data['msgArray']:
+                # 判斷是上市還是上櫃來還原代碼
+                exchange = item.get('ex', '')
+                code_raw = item.get('c', '')
+                
+                if exchange == 'tse':
+                    original_code = f"{code_raw}.TW"
+                elif exchange == 'otc':
+                    original_code = f"{code_raw}.TWO"
+                else:
+                    original_code = code_raw # fallback
+
+                # 解析價格 (z: 最近成交, y: 昨收)
                 try:
-                    hist = yf_data if len(all_query) == 1 else yf_data[code]
+                    price_str = item.get('z', '-')
+                    if price_str == '-': # 若無成交，找最佳買賣價
+                        price_str = item.get('b', '').split('_')[0]
+                    
+                    price = float(price_str) if price_str and price_str != '-' else 0.0
+                    prev_close = float(item.get('y', 0.0))
+                    
+                    # 計算漲跌
+                    if price > 0 and prev_close > 0:
+                        change_val = price - prev_close
+                        change_pct = (change_val / prev_close * 100)
+                    else:
+                        change_val = 0
+                        change_pct = 0
+                        
+                    results[original_code] = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'realtime': True}
+                except:
+                    results[original_code] = {'p': 0, 'chg': 0, 'chg_pct': 0, 'realtime': False}
+                    
+    except Exception as e:
+        st.error(f"證交所連線錯誤 (Handled): {e}")
+        
+    return results
+
+@st.cache_data(ttl=10) 
+def get_batch_market_data(codes, usdtwd_rate):
+    """
+    混合雙引擎：
+    1. 台股 -> 使用手動 requests (verify=False)
+    2. 美股 -> 使用 yfinance
+    """
+    if not codes: return {}
+    
+    tw_query = [c for c in codes if '.TW' in c or '.TWO' in c]
+    other_query = [c for c in codes if c not in tw_query]
+    
+    results = {}
+    
+    # --- 引擎 1: 台股 (手動 requests) ---
+    if tw_query:
+        tw_results = fetch_twse_realtime(tw_query)
+        results.update(tw_results)
+
+    # --- 引擎 2: 美股 / 補漏 (yfinance) ---
+    # 如果有美股，或者台股抓失敗，用 yfinance 補
+    # 這裡我們只查美股，台股失敗就算了(避免重複變慢)，或者也可以把失敗的加進來
+    # 簡單起見，只查美股
+    
+    if other_query:
+        try:
+            yf_data = yf.download(other_query, period="5d", group_by='ticker', progress=False, auto_adjust=False)
+            for code in other_query:
+                try:
+                    hist = yf_data if len(other_query) == 1 else yf_data[code]
                     if 'Close' in hist.columns:
                         clean = hist['Close'].dropna()
                         if not clean.empty:
-                            last_yf_price = float(clean.iloc[-1])
-                            prev_close = float(clean.iloc[-2]) if len(clean) >= 2 else last_yf_price
+                            price = float(clean.iloc[-1])
+                            prev_close = float(clean.iloc[-2]) if len(clean) >= 2 else price
                             
-                            # 整合邏輯：
-                            if code in results and results[code].get('realtime'):
-                                # 如果 twstock 已經抓到即時價，就用 twstock 的價
-                                # 但用 yfinance 的 prev_close 來算漲跌 (比較準)
-                                current_p = results[code]['p']
-                            else:
-                                # 美股或 twstock 失敗，就用 yfinance
-                                current_p = last_yf_price
-                            
-                            change_val = current_p - prev_close
+                            change_val = price - prev_close
                             change_pct = (change_val / prev_close * 100) if prev_close else 0
                             
-                            results[code] = {'p': current_p, 'chg': change_val, 'chg_pct': change_pct}
+                            results[code] = {'p': price, 'chg': change_val, 'chg_pct': change_pct}
                         else:
-                             if code not in results: results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+                            if code not in results: results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
                 except:
                     if code not in results: results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
         except: pass
+
+    # 確保所有 code 都有回傳值 (防呆)
+    for c in codes:
+        if c not in results:
+             results[c] = {'p': 0, 'chg': 0, 'chg_pct': 0}
 
     return results
 
