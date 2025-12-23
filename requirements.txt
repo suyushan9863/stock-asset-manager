@@ -5,3 +5,5 @@ matplotlib
 gspread
 oauth2client
 plotly
+twstock
+lxml
