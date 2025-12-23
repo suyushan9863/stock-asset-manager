@@ -113,7 +113,7 @@ def record_history(client, username, net_asset, current_principal):
         except: pass
         hist_sheet.append_row([today, int(net_asset), int(current_principal)])
 
-# --- 核心計算邏輯 (修正版) ---
+# --- 核心計算邏輯 (穩定修復版) ---
 
 @st.cache_data(ttl=300)
 def get_usdtwd():
@@ -126,47 +126,64 @@ def get_usdtwd():
         return 32.5
     except: return 32.5
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=60)
 def get_batch_market_data(codes, usdtwd_rate):
     """
-    修正版：使用 yf.Tickers + fast_info 獲取更準確的「日損益」
-    避免因為 download 歷史資料延遲而導致日損益計算成昨天的漲跌
+    回歸最穩定的 yf.download 方法，
+    並加入 auto_adjust=False 確保價格與券商一致。
     """
     if not codes: return {}
     
-    results = {}
+    # 分離台股美股 (有助於 debug，雖非必要但較保險)
+    tw_stocks = [c for c in codes if '.TW' in c or '.TWO' in c]
+    us_stocks = [c for c in codes if c not in tw_stocks]
+    all_tickers = tw_stocks + us_stocks
     
+    results = {}
+    if not all_tickers: return {}
+
     try:
-        # 使用 Tickers 一次建立所有物件
-        tickers = yf.Tickers(' '.join(codes))
+        # 下載 5 天資料，確保能抓到「昨日收盤價」
+        # auto_adjust=False: 確保抓到的是原始價格，而非還原權值價
+        df = yf.download(all_tickers, period="5d", group_by='ticker', threads=True, progress=False, auto_adjust=False)
         
-        for code in codes:
+        for code in all_tickers:
             try:
-                # 取得特定代碼的 Ticker 物件
-                t = tickers.tickers[code]
+                # 處理單檔或多檔的 DataFrame 結構差異
+                hist = df if len(all_tickers) == 1 else df[code]
                 
-                # 使用 fast_info 讀取即時與昨日資訊
-                # last_price: 最新成交價
-                # previous_close: 昨日正式收盤價
-                price = t.fast_info.get('last_price', 0)
-                prev_close = t.fast_info.get('previous_close', 0)
+                if hist.empty or 'Close' not in hist.columns:
+                    results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+                    continue
+
+                # 移除空值 (有些股票可能這幾天暫停交易)
+                hist_clean = hist['Close'].dropna()
+                if hist_clean.empty:
+                    results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+                    continue
                 
-                # 如果讀取失敗 (例如有些冷門股或剛開盤)，嘗試 fallback 到 0
-                if price is None: price = 0
-                if prev_close is None: prev_close = 0
+                # 取得最新價格
+                price = float(hist_clean.iloc[-1])
                 
-                if price > 0 and prev_close > 0:
+                # 計算日漲跌 (與前一筆交易日比較)
+                if len(hist_clean) >= 2:
+                    prev_close = float(hist_clean.iloc[-2])
                     change_val = price - prev_close
-                    change_pct = (change_val / prev_close * 100)
+                    change_pct = (change_val / prev_close * 100) if prev_close != 0 else 0
                 else:
-                    change_val = 0
-                    change_pct = 0
+                    # 如果只有一筆資料 (例如新上市或剛抓到)，嘗試用 Open 計算
+                    if 'Open' in hist.columns:
+                        first_open = hist['Open'].dropna().iloc[-1]
+                        change_val = price - float(first_open)
+                        change_pct = (change_val / float(first_open) * 100) if float(first_open) != 0 else 0
+                    else:
+                        change_val = 0
+                        change_pct = 0
                 
                 results[code] = {'p': price, 'chg': change_val, 'chg_pct': change_pct}
                 
             except Exception as e:
-                # 若單檔失敗，回傳 0 避免當機
-                # print(f"Error fetching {code}: {e}")
+                # print(f"Error processing {code}: {e}")
                 results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
                 
     except Exception as e:
@@ -178,7 +195,8 @@ def get_batch_market_data(codes, usdtwd_rate):
 def get_benchmark_data(start_date):
     tickers = ['0050.TW', 'SPY', 'QQQ']
     try:
-        df = yf.download(tickers, start=start_date, group_by='ticker', progress=False)
+        # 同樣加上 auto_adjust=False
+        df = yf.download(tickers, start=start_date, group_by='ticker', progress=False, auto_adjust=False)
         benchmarks = {}
         for t in tickers:
             sub_df = df if len(tickers) == 1 else df[t]
