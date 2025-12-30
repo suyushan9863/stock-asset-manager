@@ -397,75 +397,47 @@ with st.sidebar:
                 st.success(f"買入成功！{code_in}"); st.rerun()
         else: st.error("資料不完整")
 
-    st.markdown("---")
-
-    st.subheader("🔴 賣出股票")
-    holdings_list = list(data.get('h', {}).keys())
-    if holdings_list:
-        sell_code = st.selectbox("賣出代碼", ["請選擇"] + holdings_list, key="sell_select")
-        if sell_code != "請選擇":
-            current_hold = data['h'][sell_code]['s']
-            st.caption(f"持有: {current_hold} 股")
-            sc1, sc2 = st.columns(2)
-            sell_qty = sc1.number_input("賣出股數", min_value=1, max_value=int(current_hold), value=int(current_hold), step=100)
-            sell_price = sc2.number_input("賣出單價", min_value=0.0, value=0.0, step=0.1, format="%.2f")
-            
-            if st.button("確認賣出"):
-                if sell_price > 0:
-                    info = data['h'][sell_code]
-                    lots = info.get('lots', [])
-                    rate = 1.0 if ('.TW' in sell_code or '.TWO' in sell_code) else get_usdtwd()
-                    sell_revenue = sell_qty * sell_price * rate
-                    remain_to_sell = sell_qty
-                    total_cost_basis = 0
-                    total_debt_repaid = 0
-                    new_lots = []
-                    for lot in lots:
-                        if remain_to_sell > 0:
-                            take_qty = min(lot['s'], remain_to_sell)
-                            lot_cost = take_qty * lot['p'] * rate
-                            lot_debt = lot.get('debt', 0) * (take_qty / lot['s']) if lot['s'] > 0 else 0
-                            total_cost_basis += lot_cost
-                            total_debt_repaid += lot_debt
-                            lot['s'] -= take_qty
-                            lot['debt'] -= lot_debt
-                            remain_to_sell -= take_qty
-                            if lot['s'] > 0: new_lots.append(lot)
-                        else: new_lots.append(lot)
-                    
-                    realized_profit = sell_revenue - total_cost_basis
-                    realized_roi = (realized_profit / total_cost_basis * 100) if total_cost_basis else 0
-                    cash_back = sell_revenue - total_debt_repaid
-                    data['cash'] += cash_back
-                    
-                    if new_lots:
-                        data['h'][sell_code]['lots'] = new_lots
-                        data['h'][sell_code]['s'] -= sell_qty
-                        ts = sum(l['s'] for l in new_lots)
-                        tc = sum(l['s']*l['p'] for l in new_lots)
-                        data['h'][sell_code]['c'] = tc / ts if ts else 0
-                    else: del data['h'][sell_code]
-                    
-                    if 'history' not in data: data['history'] = []
-                    data['history'].append({
-                        'd': datetime.now().strftime('%Y-%m-%d'), 'code': sell_code,
-                        'name': STOCK_MAP.get(sell_code, sell_code), 'qty': sell_qty,
-                        'buy_cost': total_cost_basis, 'sell_rev': sell_revenue,
-                        'profit': realized_profit, 'roi': realized_roi
-                    })
-                    save_data(sheet, data)
-                    st.success(f"賣出成功"); st.balloons(); st.rerun()
-
-    st.markdown("---")
-    with st.expander("🔧 修正/刪除"):
+   st.markdown("---")
+    with st.expander("🔧 修正/刪除 (含刪除退款功能)"):
         del_list = list(data.get('h', {}).keys())
         if del_list:
-            to_del_code = st.selectbox("刪除", ["請選擇"] + del_list)
-            if to_del_code != "請選擇" and st.button("強制刪除"):
-                del data['h'][to_del_code]
-                save_data(sheet, data)
-                st.rerun()
+            to_del_code = st.selectbox("選擇要處理的股票", ["請選擇"] + del_list)
+            
+            if to_del_code != "請選擇":
+                # 取得該股票當前資訊
+                info = data['h'][to_del_code]
+                current_s = info.get('s', 0)
+                current_c = info.get('c', 0)
+                # 計算剩餘總成本 (這是當初從現金扣掉的錢)
+                # 注意：這裡簡單估算剩餘股數的成本，若有融資需另外扣除債務，這裡簡化為現股邏輯
+                rate = 1.0 if ('.TW' in to_del_code or '.TWO' in to_del_code) else get_usdtwd()
+                total_cost_basis = current_s * current_c * rate
+                
+                st.write(f"📊 持有股數: {current_s}, 平均成本: {current_c}")
+                st.write(f"💰 估算原始投入成本: ${int(total_cost_basis):,}")
 
+                col_del_1, col_del_2 = st.columns(2)
+                
+                # 選項 A: 僅刪除紀錄 (錢不退回) - 適用於資料輸入錯誤，且你已經手動調整過現金
+                with col_del_1:
+                    if st.button("❌ 僅刪除代碼 (不退錢)", type="secondary"):
+                        del data['h'][to_del_code]
+                        save_data(sheet, data)
+                        st.success(f"已刪除 {to_del_code}，現金未變動。")
+                        time.sleep(1)
+                        st.rerun()
+
+                # 選項 B: 刪除並退款 (救星) - 適用於買錯了想直接復原
+                with col_del_2:
+                    if st.button("💸 刪除並退回現金 (復原)", type="primary"):
+                        # 加回現金
+                        data['cash'] += total_cost_basis
+                        # 刪除庫存
+                        del data['h'][to_del_code]
+                        save_data(sheet, data)
+                        st.success(f"已刪除 {to_del_code}，並將 ${int(total_cost_basis):,} 加回現金！")
+                        time.sleep(1)
+                        st.rerun()
 # --- 資料更新按鈕 ---
 # 初始化 session state 中的 dashboard_data
 if 'dashboard_data' not in st.session_state:
