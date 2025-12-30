@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import requests # 新增 requests 用於手動抓取
+import requests
 import time
 import json
 import gspread
@@ -11,18 +11,19 @@ import plotly.express as px
 import plotly.graph_objects as go
 import urllib3
 
-# 忽略 SSL 警告 (解決 Streamlit Cloud 連線證交所失敗的問題)
+# 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 設定頁面配置
 st.set_page_config(page_title="全功能資產管家 Pro", layout="wide", page_icon="📈")
 
-# --- 股票代碼與名稱對照表 ---
+# --- 股票代碼與名稱對照表 (可自行擴充) ---
 STOCK_MAP = {
     '2330.TW': '台積電', '2317.TW': '鴻海', '2454.TW': '聯發科',
     '2603.TW': '長榮', '2609.TW': '陽明', '2615.TW': '萬海',
     '3231.TW': '緯創', '2382.TW': '廣達', '3017.TW': '奇鋐',
-    '2301.TW': '光寶科', '00685L.TW': '群益台指正2', '00670L.TW': '元大NASDAQ正2',
+    '2301.TW': '光寶科', '6488.TWO': '環球晶', '8271.TWO': '宇瞻',
+    '00685L.TW': '群益台指正2', '00670L.TW': '元大NASDAQ正2',
     'NVDA': '輝達', 'AAPL': '蘋果', 'TSLA': '特斯拉', 'AMD': '超微',
     'MSFT': '微軟', 'GOOG': '谷歌', 'AMZN': '亞馬遜',
     '0050.TW': '元大台灣50', 'SPY': 'S&P 500', 'QQQ': '納斯達克100'
@@ -83,7 +84,7 @@ def load_data(sheet):
             if 'history' not in data: data['history'] = []
             if 'principal' not in data: data['principal'] = data.get('cash', 0.0)
             
-            # 資料清洗
+            # 資料清洗與相容性處理
             for code in data.get('h', {}):
                 if 'lots' not in data['h'][code]:
                     data['h'][code]['lots'] = [{
@@ -119,7 +120,7 @@ def record_history(client, username, net_asset, current_principal):
         except: pass
         hist_sheet.append_row([today, int(net_asset), int(current_principal)])
 
-# --- 核心計算邏輯 (混合引擎 + SSL修復) ---
+# --- 核心計算邏輯 (混合引擎 + SSL修復 + User-Agent) ---
 
 @st.cache_data(ttl=300)
 def get_usdtwd():
@@ -134,21 +135,21 @@ def get_usdtwd():
 
 def fetch_twse_realtime(codes):
     """
-    手動連線證交所 API，並強制 verify=False 繞過 SSL 錯誤。
-    取代 twstock 套件以解決 Streamlit Cloud 連線問題。
+    更新版：加入 User-Agent 偽裝成瀏覽器，解決 Streamlit Cloud 被擋的問題。
+    支援 .TW (上市) 和 .TWO (上櫃)。
     """
     if not codes: return {}
     
-    # 1. 組合查詢字串 (tse_2330.tw|otc_8271.tw)
     query_parts = []
     for c in codes:
-        if '.TW' in c:
+        c_upper = c.upper()
+        if '.TW' in c_upper and '.TWO' not in c_upper:
             # 上市
-            raw = c.replace('.TW', '')
+            raw = c_upper.replace('.TW', '')
             query_parts.append(f"tse_{raw}.tw")
-        elif '.TWO' in c:
-            # 上櫃
-            raw = c.replace('.TWO', '')
+        elif '.TWO' in c_upper:
+            # 上櫃 (如 6488.TWO)
+            raw = c_upper.replace('.TWO', '')
             query_parts.append(f"otc_{raw}.tw")
     
     if not query_parts: return {}
@@ -157,15 +158,27 @@ def fetch_twse_realtime(codes):
     timestamp = int(time.time() * 1000)
     url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={query_str}&json=1&delay=0&_={timestamp}"
     
+    # 關鍵修正：加入 Header 偽裝成一般瀏覽器
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?stock=2330",
+        "Connection": "keep-alive"
+    }
+
     results = {}
     try:
-        # 關鍵：verify=False 忽略憑證錯誤
-        response = requests.get(url, verify=False, timeout=5)
+        session = requests.Session()
+        response = session.get(url, headers=headers, verify=False, timeout=10)
+        
+        if response.status_code != 200:
+            st.error(f"證交所連線被拒 (Code {response.status_code})")
+            return {}
+
         data = response.json()
         
         if 'msgArray' in data:
             for item in data['msgArray']:
-                # 判斷是上市還是上櫃來還原代碼
                 exchange = item.get('ex', '')
                 code_raw = item.get('c', '')
                 
@@ -174,41 +187,36 @@ def fetch_twse_realtime(codes):
                 elif exchange == 'otc':
                     original_code = f"{code_raw}.TWO"
                 else:
-                    original_code = code_raw # fallback
+                    original_code = code_raw
 
-                # 解析價格 (z: 最近成交, y: 昨收)
                 try:
                     price_str = item.get('z', '-')
-                    if price_str == '-': # 若無成交，找最佳買賣價
-                        price_str = item.get('b', '').split('_')[0]
+                    if price_str == '-':
+                        bid = item.get('b', '').split('_')[0]
+                        ask = item.get('a', '').split('_')[0]
+                        if bid and bid != '-': price_str = bid
+                        elif ask and ask != '-': price_str = ask
                     
                     price = float(price_str) if price_str and price_str != '-' else 0.0
                     prev_close = float(item.get('y', 0.0))
                     
-                    # 計算漲跌
                     if price > 0 and prev_close > 0:
                         change_val = price - prev_close
                         change_pct = (change_val / prev_close * 100)
                     else:
-                        change_val = 0
-                        change_pct = 0
+                        change_val = 0; change_pct = 0
                         
                     results[original_code] = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'realtime': True}
                 except:
                     results[original_code] = {'p': 0, 'chg': 0, 'chg_pct': 0, 'realtime': False}
                     
     except Exception as e:
-        st.error(f"證交所連線錯誤 (Handled): {e}")
+        pass
         
     return results
 
 @st.cache_data(ttl=10) 
 def get_batch_market_data(codes, usdtwd_rate):
-    """
-    混合雙引擎：
-    1. 台股 -> 使用手動 requests (verify=False)
-    2. 美股 -> 使用 yfinance
-    """
     if not codes: return {}
     
     tw_query = [c for c in codes if '.TW' in c or '.TWO' in c]
@@ -216,16 +224,12 @@ def get_batch_market_data(codes, usdtwd_rate):
     
     results = {}
     
-    # --- 引擎 1: 台股 (手動 requests) ---
+    # 1. 台股 (手動 requests + User-Agent)
     if tw_query:
         tw_results = fetch_twse_realtime(tw_query)
         results.update(tw_results)
 
-    # --- 引擎 2: 美股 / 補漏 (yfinance) ---
-    # 如果有美股，或者台股抓失敗，用 yfinance 補
-    # 這裡我們只查美股，台股失敗就算了(避免重複變慢)，或者也可以把失敗的加進來
-    # 簡單起見，只查美股
-    
+    # 2. 美股 (yfinance)
     if other_query:
         try:
             yf_data = yf.download(other_query, period="5d", group_by='ticker', progress=False, auto_adjust=False)
@@ -248,10 +252,21 @@ def get_batch_market_data(codes, usdtwd_rate):
                     if code not in results: results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
         except: pass
 
-    # 確保所有 code 都有回傳值 (防呆)
+    # 防呆補零
     for c in codes:
         if c not in results:
              results[c] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+
+    # 3. 手動更新覆蓋 (Emergency Override)
+    if 'manual_prices' in st.session_state:
+        for m_code, m_price in st.session_state.manual_prices.items():
+            if m_code in results and m_price > 0:
+                results[m_code]['p'] = m_price
+                # 手動設定時，漲跌幅設為 0 以避免誤導
+                results[m_code]['chg'] = 0
+                results[m_code]['chg_pct'] = 0
+            elif m_code not in results and m_price > 0:
+                results[m_code] = {'p': m_price, 'chg': 0, 'chg_pct': 0}
 
     return results
 
@@ -332,7 +347,7 @@ with st.sidebar:
     st.metric("現金餘額", f"${int(data.get('cash', 0)):,}")
     
     with st.expander("⚙️ 系統設定 / 本金校正"):
-        st.info("若報酬率計算異常(水平線)，請點擊下方按鈕。")
+        st.info("若報酬率計算異常，請點擊下方按鈕進行自動校正。")
         if st.button("🔄 自動校正本金"):
             current_stock_cost = 0
             for code, info in data.get('h', {}).items():
@@ -360,7 +375,7 @@ with st.sidebar:
     st.markdown("---")
     
     st.subheader("🔵 買入股票")
-    code_in = st.text_input("買入代碼 (如 2330.TW)").strip().upper()
+    code_in = st.text_input("買入代碼 (如 2330.TW, 6488.TWO)").strip().upper()
     c1, c2 = st.columns(2)
     shares_in = c1.number_input("買入股數", min_value=1, value=1000, step=100)
     cost_in = c2.number_input("買入單價", min_value=0.0, value=0.0, step=0.1, format="%.2f")
@@ -397,19 +412,77 @@ with st.sidebar:
                 st.success(f"買入成功！{code_in}"); st.rerun()
         else: st.error("資料不完整")
 
-   st.markdown("---")
-    with st.expander("🔧 修正/刪除 (含刪除退款功能)"):
+    st.markdown("---")
+
+    st.subheader("🔴 賣出股票")
+    holdings_list = list(data.get('h', {}).keys())
+    if holdings_list:
+        sell_code = st.selectbox("賣出代碼", ["請選擇"] + holdings_list, key="sell_select")
+        if sell_code != "請選擇":
+            current_hold = data['h'][sell_code]['s']
+            st.caption(f"持有: {current_hold} 股")
+            sc1, sc2 = st.columns(2)
+            sell_qty = sc1.number_input("賣出股數", min_value=1, max_value=int(current_hold), value=int(current_hold), step=100)
+            sell_price = sc2.number_input("賣出單價", min_value=0.0, value=0.0, step=0.1, format="%.2f")
+            
+            if st.button("確認賣出"):
+                if sell_price > 0:
+                    info = data['h'][sell_code]
+                    lots = info.get('lots', [])
+                    rate = 1.0 if ('.TW' in sell_code or '.TWO' in sell_code) else get_usdtwd()
+                    sell_revenue = sell_qty * sell_price * rate
+                    remain_to_sell = sell_qty
+                    total_cost_basis = 0
+                    total_debt_repaid = 0
+                    new_lots = []
+                    for lot in lots:
+                        if remain_to_sell > 0:
+                            take_qty = min(lot['s'], remain_to_sell)
+                            lot_cost = take_qty * lot['p'] * rate
+                            lot_debt = lot.get('debt', 0) * (take_qty / lot['s']) if lot['s'] > 0 else 0
+                            total_cost_basis += lot_cost
+                            total_debt_repaid += lot_debt
+                            lot['s'] -= take_qty
+                            lot['debt'] -= lot_debt
+                            remain_to_sell -= take_qty
+                            if lot['s'] > 0: new_lots.append(lot)
+                        else: new_lots.append(lot)
+                    
+                    realized_profit = sell_revenue - total_cost_basis
+                    realized_roi = (realized_profit / total_cost_basis * 100) if total_cost_basis else 0
+                    cash_back = sell_revenue - total_debt_repaid
+                    data['cash'] += cash_back
+                    
+                    if new_lots:
+                        data['h'][sell_code]['lots'] = new_lots
+                        data['h'][sell_code]['s'] -= sell_qty
+                        ts = sum(l['s'] for l in new_lots)
+                        tc = sum(l['s']*l['p'] for l in new_lots)
+                        data['h'][sell_code]['c'] = tc / ts if ts else 0
+                    else: del data['h'][sell_code]
+                    
+                    if 'history' not in data: data['history'] = []
+                    data['history'].append({
+                        'd': datetime.now().strftime('%Y-%m-%d'), 'code': sell_code,
+                        'name': STOCK_MAP.get(sell_code, sell_code), 'qty': sell_qty,
+                        'buy_cost': total_cost_basis, 'sell_rev': sell_revenue,
+                        'profit': realized_profit, 'roi': realized_roi
+                    })
+                    save_data(sheet, data)
+                    st.success(f"賣出成功"); st.balloons(); st.rerun()
+
+    st.markdown("---")
+    
+    # 修正/刪除 (含退款功能)
+    with st.expander("🔧 修正/刪除 (含刪除退款)"):
         del_list = list(data.get('h', {}).keys())
         if del_list:
             to_del_code = st.selectbox("選擇要處理的股票", ["請選擇"] + del_list)
             
             if to_del_code != "請選擇":
-                # 取得該股票當前資訊
                 info = data['h'][to_del_code]
                 current_s = info.get('s', 0)
                 current_c = info.get('c', 0)
-                # 計算剩餘總成本 (這是當初從現金扣掉的錢)
-                # 注意：這裡簡單估算剩餘股數的成本，若有融資需另外扣除債務，這裡簡化為現股邏輯
                 rate = 1.0 if ('.TW' in to_del_code or '.TWO' in to_del_code) else get_usdtwd()
                 total_cost_basis = current_s * current_c * rate
                 
@@ -418,32 +491,41 @@ with st.sidebar:
 
                 col_del_1, col_del_2 = st.columns(2)
                 
-                # 選項 A: 僅刪除紀錄 (錢不退回) - 適用於資料輸入錯誤，且你已經手動調整過現金
                 with col_del_1:
-                    if st.button("❌ 僅刪除代碼 (不退錢)", type="secondary"):
+                    if st.button("❌ 僅刪除代碼", type="secondary"):
                         del data['h'][to_del_code]
                         save_data(sheet, data)
-                        st.success(f"已刪除 {to_del_code}，現金未變動。")
-                        time.sleep(1)
-                        st.rerun()
+                        st.success(f"已刪除 {to_del_code}"); time.sleep(1); st.rerun()
 
-                # 選項 B: 刪除並退款 (救星) - 適用於買錯了想直接復原
                 with col_del_2:
-                    if st.button("💸 刪除並退回現金 (復原)", type="primary"):
-                        # 加回現金
+                    if st.button("💸 刪除並退回現金", type="primary"):
                         data['cash'] += total_cost_basis
-                        # 刪除庫存
                         del data['h'][to_del_code]
                         save_data(sheet, data)
-                        st.success(f"已刪除 {to_del_code}，並將 ${int(total_cost_basis):,} 加回現金！")
-                        time.sleep(1)
-                        st.rerun()
-st.markdown("---")
+                        st.success(f"已刪除並退款"); time.sleep(1); st.rerun()
+
+    st.markdown("---")
+    
+    # 手動更新股價 (API 失敗時用)
+    with st.expander("🆘 手動更新股價 (API 失敗時用)"):
+        st.caption("如果 6488.TWO 抓不到價格，請在此手動輸入。")
+        man_code = st.selectbox("選擇股票", list(data.get('h', {}).keys()), key="man_update_sel")
+        man_price = st.number_input("輸入現價", min_value=0.0, step=0.5, key="man_update_price")
+        
+        if st.button("強制更新價格"):
+            if 'manual_prices' not in st.session_state:
+                st.session_state.manual_prices = {}
+            st.session_state.manual_prices[man_code] = man_price
+            st.success(f"{man_code} 價格暫時設定為 {man_price}")
+            st.rerun()
+
+    st.markdown("---")
+
+    # 強制修改本金 (解決補回現金導致的收益計算錯誤)
     with st.expander("⚙️ 進階：強制修改本金"):
         st.info(f"目前系統記錄本金: ${int(data.get('principal', 0)):,}")
-        st.caption("因為手動補回現金會導致本金虛增，請在此修正為您「真正」從口袋拿出來的總金額。")
+        st.caption("手動補回現金後，請在此修正為您真正投入的總金額。")
         
-        # 讓您可以直接輸入正確的本金
         real_principal = st.number_input("設定正確本金", value=float(data.get('principal', 0)), step=10000.0)
         
         if st.button("確認修正本金"):
@@ -453,13 +535,10 @@ st.markdown("---")
             time.sleep(1)
             st.rerun()
 
-
 # --- 資料更新按鈕 ---
-# 初始化 session state 中的 dashboard_data
 if 'dashboard_data' not in st.session_state:
     st.session_state.dashboard_data = None
 
-# 按鈕只負責「計算並存入 State」
 if st.button("🔄 更新即時報價 (極速版)", type="primary", use_container_width=True):
     with st.spinner('正在同步市場數據 (台股即時+美股)...'):
         usdtwd = get_usdtwd()
@@ -514,16 +593,13 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
         net_asset = (total_mkt_val + data['cash']) - total_debt
         unrealized_profit = total_mkt_val - total_cost_val
         
-        # 紀錄歷史與本金
         current_principal = data.get('principal', data['cash'])
         if client: record_history(client, username, net_asset, current_principal)
 
-        # 計算 ROI
         total_realized_profit = sum(r.get('profit', 0) for r in data.get('history', []))
         roi_basis = current_principal if current_principal > 0 else 1
         total_roi_pct = ((net_asset - current_principal) / roi_basis) * 100
 
-        # 將計算結果存入 session_state
         st.session_state.dashboard_data = {
             'net_asset': net_asset,
             'cash': data.get('cash', 0),
@@ -539,7 +615,6 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
 
 # --- 顯示層 ---
 if st.session_state.dashboard_data:
-    # 從 state 取出資料
     d = st.session_state.dashboard_data
     
     st.subheader("🏦 資產概況")
@@ -590,7 +665,7 @@ if st.session_state.dashboard_data:
         else: st.info("無數據")
 
     with tab3:
-        st.caption("ℹ️ 資產走勢分析：可切換查看「獲利金額」或「報酬率」 (已排除入金造成的資產虛增)")
+        st.caption("ℹ️ 資產走勢分析：可切換查看「獲利金額」或「報酬率」")
         
         if client:
             hs = get_user_history_sheet(client, username)
@@ -608,15 +683,12 @@ if st.session_state.dashboard_data:
                     else:
                         dfh['Principal'] = dfh['NetAsset'] 
 
-                    # 避免本金為 0
                     dfh['Principal'] = dfh.apply(lambda x: x['NetAsset'] if x['Principal'] == 0 else x['Principal'], axis=1)
                     dfh = dfh.sort_values('Date')
 
-                    # [核心公式] 損益 = 淨資產 - 本金
                     dfh['Profit_Val'] = dfh['NetAsset'] - dfh['Principal']
                     dfh['ROI_Pct'] = (dfh['Profit_Val'] / dfh['Principal']) * 100
                     
-                    # 這裡切換 Radio Button 時，因為外層不在 button 內，所以圖表不會消失
                     view_type = st.radio("顯示模式", ["💰 總損益金額 (TWD)", "📈 累計報酬率 (%)"], horizontal=True)
 
                     fig = go.Figure()
