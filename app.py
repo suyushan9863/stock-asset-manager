@@ -438,6 +438,22 @@ with st.sidebar:
                         st.success(f"已刪除 {to_del_code}，並將 ${int(total_cost_basis):,} 加回現金！")
                         time.sleep(1)
                         st.rerun()
+st.markdown("---")
+    with st.expander("⚙️ 進階：強制修改本金"):
+        st.info(f"目前系統記錄本金: ${int(data.get('principal', 0)):,}")
+        st.caption("因為手動補回現金會導致本金虛增，請在此修正為您「真正」從口袋拿出來的總金額。")
+        
+        # 讓您可以直接輸入正確的本金
+        real_principal = st.number_input("設定正確本金", value=float(data.get('principal', 0)), step=10000.0)
+        
+        if st.button("確認修正本金"):
+            data['principal'] = real_principal
+            save_data(sheet, data)
+            st.success(f"本金已修正為 ${int(real_principal):,}")
+            time.sleep(1)
+            st.rerun()
+
+
 # --- 資料更新按鈕 ---
 # 初始化 session state 中的 dashboard_data
 if 'dashboard_data' not in st.session_state:
