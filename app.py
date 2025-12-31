@@ -14,8 +14,8 @@ import urllib3
 # 忽略 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 設定頁面配置
-st.set_page_config(page_title="全功能資產管家 Pro", layout="wide", page_icon="📈")
+# 設定頁面配置 (注意：這裡加了 v2.0 方便您確認更新成功)
+st.set_page_config(page_title="全功能資產管家 Pro v2.0", layout="wide", page_icon="📈")
 
 # --- 股票代碼與名稱對照表 (可自行擴充) ---
 STOCK_MAP = {
@@ -120,7 +120,7 @@ def record_history(client, username, net_asset, current_principal):
         except: pass
         hist_sheet.append_row([today, int(net_asset), int(current_principal)])
 
-# --- 核心計算邏輯 (混合引擎 + SSL修復 + User-Agent) ---
+# --- 核心計算邏輯 ---
 
 @st.cache_data(ttl=300)
 def get_usdtwd():
@@ -136,7 +136,6 @@ def get_usdtwd():
 def fetch_twse_realtime(codes):
     """
     更新版：加入 User-Agent 偽裝成瀏覽器，解決 Streamlit Cloud 被擋的問題。
-    支援 .TW (上市) 和 .TWO (上櫃)。
     """
     if not codes: return {}
     
@@ -148,7 +147,7 @@ def fetch_twse_realtime(codes):
             raw = c_upper.replace('.TW', '')
             query_parts.append(f"tse_{raw}.tw")
         elif '.TWO' in c_upper:
-            # 上櫃 (如 6488.TWO)
+            # 上櫃
             raw = c_upper.replace('.TWO', '')
             query_parts.append(f"otc_{raw}.tw")
     
@@ -158,7 +157,6 @@ def fetch_twse_realtime(codes):
     timestamp = int(time.time() * 1000)
     url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={query_str}&json=1&delay=0&_={timestamp}"
     
-    # 關鍵修正：加入 Header 偽裝成一般瀏覽器
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -224,12 +222,12 @@ def get_batch_market_data(codes, usdtwd_rate):
     
     results = {}
     
-    # 1. 台股 (手動 requests + User-Agent)
+    # 1. 台股
     if tw_query:
         tw_results = fetch_twse_realtime(tw_query)
         results.update(tw_results)
 
-    # 2. 美股 (yfinance)
+    # 2. 美股
     if other_query:
         try:
             yf_data = yf.download(other_query, period="5d", group_by='ticker', progress=False, auto_adjust=False)
@@ -252,17 +250,16 @@ def get_batch_market_data(codes, usdtwd_rate):
                     if code not in results: results[code] = {'p': 0, 'chg': 0, 'chg_pct': 0}
         except: pass
 
-    # 防呆補零
+    # 防呆
     for c in codes:
         if c not in results:
              results[c] = {'p': 0, 'chg': 0, 'chg_pct': 0}
 
-    # 3. 手動更新覆蓋 (Emergency Override)
+    # 3. 手動更新覆蓋
     if 'manual_prices' in st.session_state:
         for m_code, m_price in st.session_state.manual_prices.items():
             if m_code in results and m_price > 0:
                 results[m_code]['p'] = m_price
-                # 手動設定時，漲跌幅設為 0 以避免誤導
                 results[m_code]['chg'] = 0
                 results[m_code]['chg_pct'] = 0
             elif m_code not in results and m_price > 0:
@@ -292,11 +289,11 @@ if 'current_user' not in st.session_state:
     st.session_state.current_user = None
 
 if not st.session_state.current_user:
-    st.markdown("<h1 style='text-align: center;'>🔐 股票資產管家 Pro</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🔐 股票資產管家 Pro v2.0</h1>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1,2,1])
     with c2:
         with st.form("login_form"):
-            user_input = st.text_input("使用者名稱 (例如: Kevin)")
+            user_input = st.text_input("使用者名稱")
             pwd_input = st.text_input("密碼", type="password")
             submit = st.form_submit_button("登入", use_container_width=True)
             
@@ -473,7 +470,7 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # 修正/刪除 (含退款功能)
+    # 修正/刪除
     with st.expander("🔧 修正/刪除 (含刪除退款)"):
         del_list = list(data.get('h', {}).keys())
         if del_list:
@@ -506,7 +503,7 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # 手動更新股價 (API 失敗時用)
+    # 手動更新
     with st.expander("🆘 手動更新股價 (API 失敗時用)"):
         st.caption("如果 6488.TWO 抓不到價格，請在此手動輸入。")
         man_code = st.selectbox("選擇股票", list(data.get('h', {}).keys()), key="man_update_sel")
@@ -521,7 +518,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # 強制修改本金 (解決補回現金導致的收益計算錯誤)
+    # 強制修改本金
     with st.expander("⚙️ 進階：強制修改本金"):
         st.info(f"目前系統記錄本金: ${int(data.get('principal', 0)):,}")
         st.caption("手動補回現金後，請在此修正為您真正投入的總金額。")
@@ -593,12 +590,18 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
         net_asset = (total_mkt_val + data['cash']) - total_debt
         unrealized_profit = total_mkt_val - total_cost_val
         
+        # 取得已實現損益
+        total_realized_profit = sum(r.get('profit', 0) for r in data.get('history', []))
+        
+        # === 關鍵修改：總損益 = 未實現 + 已實現 ===
+        total_profit_sum = unrealized_profit + total_realized_profit
+        
         current_principal = data.get('principal', data['cash'])
         if client: record_history(client, username, net_asset, current_principal)
 
-        total_realized_profit = sum(r.get('profit', 0) for r in data.get('history', []))
+        # === 關鍵修改：ROI = (總損益 / 本金) ===
         roi_basis = current_principal if current_principal > 0 else 1
-        total_roi_pct = ((net_asset - current_principal) / roi_basis) * 100
+        total_roi_pct = (total_profit_sum / roi_basis) * 100
 
         st.session_state.dashboard_data = {
             'net_asset': net_asset,
@@ -608,7 +611,8 @@ if st.button("🔄 更新即時報價 (極速版)", type="primary", use_containe
             'total_day_profit': total_day_profit,
             'unrealized_profit': unrealized_profit,
             'total_realized_profit': total_realized_profit,
-            'total_roi_pct': total_roi_pct,
+            'total_profit_sum': total_profit_sum,  # 新增欄位
+            'total_roi_pct': total_roi_pct,        # 新的 ROI
             'final_rows': final_rows,
             'temp_list': temp_list
         }
@@ -628,9 +632,15 @@ if st.session_state.dashboard_data:
     st.subheader("📈 績效表現")
     kp1, kp2, kp3, kp4 = st.columns(4)
     kp1.metric("📅 今日損益", f"${int(d['total_day_profit']):+,}")
-    kp2.metric("📄 未實現損益", f"${int(d['unrealized_profit']):+,}")
-    kp3.metric("💰 已實現損益", f"${int(d['total_realized_profit']):+,}")
-    kp4.metric("🏆 總報酬率 (ROI)", f"{d['total_roi_pct']:+.2f}%")
+    
+    # 這裡就是您要的：合併顯示總損益
+    kp2.metric("💰 總損益 (已+未)", f"${int(d['total_profit_sum']):+,}")
+    
+    # 這裡就是修正後的 ROI (會是正數)
+    kp3.metric("🏆 總報酬率 (ROI)", f"{d['total_roi_pct']:+.2f}%")
+    
+    # 第四欄顯示已實現供參考
+    kp4.metric("📥 其中已實現", f"${int(d['total_realized_profit']):+,}")
 
     tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
     
