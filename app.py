@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v6.3 (Trend & Benchmark)"
+APP_VERSION = "v6.4 (Chart Sync Fix)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -188,7 +188,8 @@ def log_transaction(client, username, action, code, amount, shares, memo=""):
 def record_asset_history(client, username, net_asset, principal):
     ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
     if ws:
-        today = datetime.now().strftime('%Y-%m-%d')
+        # [Fix] 使用 UTC+8 確保日期對應台灣時間
+        today = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
         all_vals = ws.get_all_values()
         if len(all_vals) > 1 and all_vals[-1][0] == today:
             row_idx = len(all_vals)
@@ -213,17 +214,13 @@ def get_usdtwd():
 
 @st.cache_data(ttl=3600)
 def get_benchmark_data(start_date):
-    """抓取大盤數據 (0050, SPY, QQQ)"""
     benchmarks = {}
     target_tickers = [('0050.TW', '台灣50'), ('SPY', 'S&P 500'), ('QQQ', 'NASDAQ 100')]
-    
     for code, name in target_tickers:
         try:
             t = yf.Ticker(code)
-            # 抓取歷史數據
             hist = t.history(start=start_date)
             if not hist.empty:
-                # 正規化為漲跌幅百分比 (以第一天為基準 0%)
                 start_val = hist['Close'].iloc[0]
                 if start_val > 0:
                     benchmarks[name] = ((hist['Close'] / start_val) - 1) * 100
@@ -571,6 +568,22 @@ with tab3:
         df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float_col)
         df_h['Principal'] = df_h['Principal'].apply(safe_float_col)
         
+        # [Chart Sync Fix] 強制同步當下最新的淨資產到圖表末端
+        current_date = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+        # 建立今日的 DataFrame 格式
+        new_row = pd.DataFrame([{
+            'Date': pd.to_datetime(current_date),
+            'NetAsset': net_asset,
+            'Principal': data['principal']
+        }])
+        
+        # 如果今天已有資料則取代，否則新增
+        if not df_h.empty and df_h.iloc[-1]['Date'].strftime('%Y-%m-%d') == current_date:
+            df_h.iloc[-1, df_h.columns.get_loc('NetAsset')] = net_asset
+            df_h.iloc[-1, df_h.columns.get_loc('Principal')] = data['principal']
+        else:
+            df_h = pd.concat([df_h, new_row], ignore_index=True)
+
         # 切換按鈕
         view_type = st.radio("顯示模式", ["💰 淨資產走勢 (金額)", "📈 累計報酬率比較 (%)"], horizontal=True)
         
