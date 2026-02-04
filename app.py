@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v3.1 (Hotfix 3 - Force Map)"
+APP_VERSION = "v3.2 (Persistence Update)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -59,6 +59,21 @@ def get_account_sheet(client, username):
             sheet = spreadsheet.worksheet(worksheet_name)
         except gspread.exceptions.WorksheetNotFound:
             sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="20", cols="2")
+        return sheet
+    except: return None
+
+# [v3.2 New] 新增已實現損益工作表
+def get_realized_sheet(client, username):
+    try:
+        spreadsheet_name = st.secrets["spreadsheet_name"]
+        spreadsheet = client.open(spreadsheet_name)
+        worksheet_name = f"Realized_{username}"
+        try:
+            sheet = spreadsheet.worksheet(worksheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            # Date, Code, Name, Qty, BuyCost, SellRev, Profit, ROI
+            sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols="8")
+            sheet.append_row(['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
         return sheet
     except: return None
 
@@ -222,6 +237,19 @@ def load_data(client, username):
                     'last_chg_pct': float(get_val(['LastChgPct', '最後漲跌幅'], 0) or 0),
                     'lots': lots
                 }
+        
+        # [v3.2 New] Load Realized History
+        realized_data = []
+        real_sheet = get_realized_sheet(client, username)
+        if real_sheet:
+            r_rows = real_sheet.get_all_records()
+            # Convert keys to match internal logic (d, code, name...)
+            for r in r_rows:
+                realized_data.append({
+                    'd': r.get('Date'), 'code': str(r.get('Code')), 'name': r.get('Name'),
+                    'qty': r.get('Qty'), 'buy_cost': r.get('BuyCost'), 'sell_rev': r.get('SellRev'),
+                    'profit': r.get('Profit'), 'roi': r.get('ROI')
+                })
             
         return {
             'h': h_data,
@@ -229,7 +257,7 @@ def load_data(client, username):
             'principal': float(acc_data.get('Principal', 0.0)),
             'last_update': acc_data.get('LastUpdate', ''),
             'usdtwd': float(acc_data.get('USDTWD', 32.5)),
-            'history': [] 
+            'history': realized_data 
         }
 
     except Exception as e:
@@ -327,6 +355,19 @@ def save_data(client, username, data):
             
             user_sheet.clear()
             user_sheet.update('A1', rows, value_input_option='USER_ENTERED')
+        
+        # [v3.2 New] Save Realized History
+        real_sheet = get_realized_sheet(client, username)
+        if real_sheet:
+            # Overwrite realized sheet to ensure sync
+            h_rows = [['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI']]
+            for item in data.get('history', []):
+                h_rows.append([
+                    item.get('d'), item.get('code'), item.get('name'), item.get('qty'),
+                    item.get('buy_cost'), item.get('sell_rev'), item.get('profit'), item.get('roi')
+                ])
+            real_sheet.clear()
+            real_sheet.update('A1', h_rows, value_input_option='USER_ENTERED')
             
     except Exception as e: st.error(f"存檔失敗: {e}")
 
@@ -388,9 +429,7 @@ def get_usdtwd():
 
 def fetch_twse_realtime(codes):
     """
-    [v3.1] 股價抓取優化版：
-    1. 支援回傳公司名稱 'n'。
-    2. 支援暴力映射 (Force Map)，解決後綴對不上的問題。
+    [v3.1] 股價抓取優化版
     """
     if not codes: return {}
     
@@ -416,6 +455,8 @@ def fetch_twse_realtime(codes):
             for item in data['msgArray']:
                 c = item.get('c', '')
                 ex = item.get('ex', '')
+                
+                # 擷取名稱
                 name = item.get('n', '')
                 
                 price_str = item.get('z', '-')
@@ -433,9 +474,9 @@ def fetch_twse_realtime(codes):
                 change_val = price - prev_close if price > 0 else 0.0
                 change_pct = (change_val / prev_close * 100) if prev_close > 0 else 0.0
 
+                # 將名稱 'n' 也放入回傳結構
                 res_obj = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'n': name, 'realtime': True}
 
-                # 原始映射
                 results[c] = res_obj
                 if ex == 'tse': results[f"{c}.TW"] = res_obj
                 elif ex == 'otc': results[f"{c}.TWO"] = res_obj
@@ -459,6 +500,7 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
 
         if is_tw:
             prefix = 'otc' if ex in ['otc', 'TWO'] else 'tse'
+            # [v3.0] 確保代碼乾淨 (移除後綴)
             clean_code = s_code.upper().replace('.TW', '').replace('.TWO', '')
             tw_query.append(f"{prefix}_{clean_code}.tw")
         else:
@@ -468,16 +510,11 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
     
     if tw_query:
         raw_tw_results = fetch_twse_realtime(tw_query)
-        # [v3.1 Fix] 暴力映射：將結果映射到所有可能的 Key
+        # [v3.1 Fix] 暴力映射
         for raw_k, v in raw_tw_results.items():
-            # 原始 Key
             results[raw_k] = v
-            
-            # 純代碼 (4958)
             pure_k = raw_k.replace('.TW', '').replace('.TWO', '')
             results[pure_k] = v
-            
-            # 帶後綴 (4958.TW / 4958.TWO)
             results[f"{pure_k}.TW"] = v
             results[f"{pure_k}.TWO"] = v
 
@@ -550,7 +587,7 @@ def update_dashboard_data(use_realtime=True):
                 info['last_chg'] = market_info['chg']
                 info['last_chg_pct'] = market_info['chg_pct']
                 
-                # [v3.1] 自動修復名稱
+                # [v3.0] 自動修復名稱邏輯
                 current_name = info.get('n', '').strip()
                 fetched_name = market_info.get('n', '').strip()
                 
@@ -616,7 +653,8 @@ def update_dashboard_data(use_realtime=True):
         net_asset = (total_mkt_val + data['cash']) - total_debt
         unrealized_profit = total_mkt_val - total_cost_val
         
-        total_realized_profit = sum(r.get('profit', 0) for r in data.get('history', []))
+        # [v3.2 Fix] 確保 history 存在 (防止初次載入為 None)
+        total_realized_profit = sum(r.get('profit', 0) for r in (data.get('history') or []))
         total_profit_sum = unrealized_profit + total_realized_profit
         
         current_principal = data.get('principal', data['cash'])
@@ -752,10 +790,10 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
-    **v3.1 Hotfix 3 (Force Map)**
-    1.  **暴力代碼映射**: 強制將查詢結果映射到 `4958`、`4958.TW` 和 `4958.TWO`，解決臻鼎-KY (4958) 等股票因後綴問題抓不到價格的狀況。
-    2.  **公司名稱自動修復**: 系統會自動填入 API 回傳的正確公司名稱。
-    3.  **會計邏輯**: 確認本金存提邏輯為正確的淨投入計算。
+    **v3.2 Persistence Update**
+    1.  **已實現損益持久化**: 新增專屬 `Realized` 工作表儲存已結清交易，修復歷史紀錄重啟後消失的問題。
+    2.  **暴力代碼映射 (v3.1)**: 強制映射解決 4958.TW 等後綴問題。
+    3.  **名稱自動修復 (v3.0)**: 系統自動填入正確公司名稱。
     """)
 
 # --- 主程式 ---
@@ -814,7 +852,6 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("💵 資金存提 (影響本金)"):
-        st.caption("存入資金：現金增加，本金增加。\n取出資金：現金減少，本金減少。")
         if "fund_op_val" not in st.session_state: st.session_state.fund_op_val = 0.0
         if st.session_state.get("reset_fund"):
              st.session_state.fund_op_val = 0.0
@@ -973,13 +1010,16 @@ with st.sidebar:
                         data['h'][sell_code]['c'] = tc / ts if ts else 0
                     else: del data['h'][sell_code]
                     
+                    # [v3.2 Fix] History Appending Logic
                     if 'history' not in data: data['history'] = []
-                    data['history'].append({
+                    new_hist_record = {
                         'd': datetime.now().strftime('%Y-%m-%d'), 'code': sell_code,
                         'name': h_name, 'qty': sell_qty,
                         'buy_cost': total_cost_basis, 'sell_rev': sell_revenue,
                         'profit': realized_profit, 'roi': realized_roi
-                    })
+                    }
+                    data['history'].append(new_hist_record)
+                    
                     save_data(client, username, data)
                     update_dashboard_data(use_realtime=False)
                     st.success(f"賣出成功！{h_name} ({sell_code})"); st.balloons()
@@ -1228,14 +1268,14 @@ if st.session_state.dashboard_data:
         else: st.error("無法讀取歷史資料 (Client Error)")
 
     with tab4:
-        history = data.get('history', [])
+        history = data.get('history', []) or []
         if history:
             df_hist = pd.DataFrame(history[::-1])
             st.subheader(f"累計已實現損益: ${int(d['total_realized_profit']):+,}")
             if not df_hist.empty:
                 df_hist = df_hist[['d', 'code', 'name', 'qty', 'buy_cost', 'sell_rev', 'profit', 'roi']]
                 df_hist.columns = ['日期', '代碼', '名稱', '賣出股數', '總成本', '賣出收入', '獲利金額', '報酬率%']
-                df_hist['報酬率%'] = df_hist['報酬率%'] / 100
+                df_hist['報酬率%'] = pd.to_numeric(df_hist['報酬率%'], errors='coerce') / 100
                 styler_h = df_hist.style.format({
                     '賣出股數': '{:,}', '總成本': '{:,.0f}', '賣出收入': '{:,.0f}',
                     '獲利金額': '{:+,.0f}', '報酬率%': '{:+.2%}'
