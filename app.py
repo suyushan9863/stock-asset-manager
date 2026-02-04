@@ -15,9 +15,9 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.7 (Safe Float Parsing Fix)"
+APP_VERSION = "v4.8 (Pro UI + Data Fix)"
 
-# 自動清除舊快取與 Session State (解決資料結構不一致導致的 0 元問題)
+# 自動清除舊快取與 Session State (解決資料結構不一致問題)
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
     st.cache_data.clear()
     for key in list(st.session_state.keys()):
@@ -53,12 +53,12 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
             return ws
     except: return None
 
-# --- 資料讀寫核心 (大幅強化容錯率) ---
+# --- 資料讀寫核心 ---
 def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
     
-    # 定義安全轉換數值的內部函式 (處理逗號、空白、貨幣符號)
+    # 安全數值轉換 (處理逗號、$符號、空白)
     def safe_float(val):
         try:
             if isinstance(val, (int, float)): return float(val)
@@ -79,7 +79,6 @@ def load_data(client, username):
             try: lots = json.loads(r.get('Lots_Data', '[]'))
             except: lots = []
             
-            # 使用 safe_float 處理可能的格式問題
             h_data[code] = {
                 'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
                 's': safe_float(r.get('Shares', 0)), 
@@ -118,12 +117,12 @@ def load_data(client, username):
                 if len(row) >= 2:
                     net_val = str(row[1]).replace(',', '').strip()
                     princ_val = str(row[2]).replace(',', '').strip() if len(row) > 2 else net_val
-                    
-                    if net_val and net_val.replace('.', '', 1).isdigit():
+                    # 簡單過濾非數字
+                    if net_val.replace('.', '', 1).replace('-', '').isdigit():
                         asset_history.append({
                             'Date': str(row[0]).strip(),
-                            'NetAsset': float(net_val),
-                            'Principal': float(princ_val) if princ_val else float(net_val)
+                            'NetAsset': safe_float(net_val),
+                            'Principal': safe_float(princ_val)
                         })
 
     return {
@@ -388,6 +387,8 @@ total_mkt = 0; total_cost = 0; total_debt = 0; day_gain = 0
 table_rows = []
 
 for code, info in data['h'].items():
+    if info['s'] <= 0: continue # 自動隱藏已售罄但未清除的紀錄
+    
     q = quotes.get(code, {'p': info['c'], 'chg': 0, 'pct': 0, 'n': info.get('n', code)})
     if q['n'] and q['n'] != code: info['n'] = q['n']
     
@@ -446,7 +447,7 @@ k5.metric("💳 融資金額", f"${total_debt:,.0f}")
 st.subheader("📈 績效表現")
 
 # [Fix] 更強健的數值解析邏輯，處理 $ 符號與逗號，並同時檢查 Profit 與 profit 鍵值
-def safe_parse_profit(val):
+def safe_sum_profit(val):
     try:
         if isinstance(val, (int, float)): return float(val)
         s = str(val).replace(',', '').replace('$', '').replace(' ', '').replace('+', '')
@@ -454,7 +455,7 @@ def safe_parse_profit(val):
     except: return 0.0
 
 # 兼容兩種 Key (新版 Profit 與舊版 profit)
-total_realized = sum(safe_parse_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
+total_realized = sum(safe_sum_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
 day_pct = (day_gain / (total_mkt - day_gain)) * 100 if (total_mkt - day_gain) > 0 else 0
 
 kp1, kp2, kp3, kp4 = st.columns(4)
@@ -507,14 +508,14 @@ with tab3:
         df_h = df_h.dropna(subset=['Date']) # 移除解析失敗的日期
         
         # 安全解析數值，處理可能的空白或異常字元
-        def safe_float(x):
+        def safe_float_col(x):
             try: 
                 s = str(x).replace(',', '').replace('$', '').replace(' ', '')
                 return float(s)
             except: return 0.0
             
-        df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float)
-        df_h['Principal'] = df_h['Principal'].apply(safe_float)
+        df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float_col)
+        df_h['Principal'] = df_h['Principal'].apply(safe_float_col)
         
         fig_trend = go.Figure()
         fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['NetAsset'], name='淨資產', fill='tozeroy'))
