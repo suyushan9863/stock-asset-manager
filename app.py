@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.4 (Data Parsing Fix)"
+APP_VERSION = "v4.5 (History & Chart Fix)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -55,7 +55,7 @@ def load_data(client, username):
     user_ws = get_worksheet(client, f"User_{username}")
     h_data = {}
     if user_ws:
-        all_rows = user_ws.get_all_records() # 庫存結構較複雜，維持 get_all_records
+        all_rows = user_ws.get_all_records()
         for r in all_rows:
             code = str(r.get('Code', '')).strip()
             if not code: continue
@@ -74,32 +74,31 @@ def load_data(client, username):
         for row in acc_ws.get_all_values():
             if len(row) >= 2: acc_data[row[0]] = row[1]
 
-    # 3. 讀取 Realized History (已實現損益) - 改用 get_all_values 強制解析
-    # 預期欄位: Date(0), Code(1), Name(2), Qty(3), BuyCost(4), SellRev(5), Profit(6), ROI(7)
+    # 3. 讀取 Realized History (已實現損益)
     hist_ws = get_worksheet(client, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
     hist_data = []
     if hist_ws:
         raw_rows = hist_ws.get_all_values()
-        if len(raw_rows) > 1: # 確保有資料 (跳過標題)
+        if len(raw_rows) > 1:
             for row in raw_rows[1:]:
-                # 補齊長度避免 index out of range
                 row += [''] * (8 - len(row))
+                # 強制轉字串並去空白，避免格式問題
                 hist_data.append({
-                    'Date': row[0], 'Code': row[1], 'Name': row[2], 'Qty': row[3],
-                    'BuyCost': row[4], 'SellRev': row[5], 'Profit': row[6], 'ROI': row[7]
+                    'Date': str(row[0]).strip(), 'Code': str(row[1]).strip(), 
+                    'Name': str(row[2]).strip(), 'Qty': row[3], 'BuyCost': row[4], 
+                    'SellRev': row[5], 'Profit': row[6], 'ROI': row[7]
                 })
 
-    # 4. 讀取 Asset History (資產走勢) - 改用 get_all_values 強制解析
-    # 預期欄位: Date(0), NetAsset(1), Principal(2)
+    # 4. 讀取 Asset History (資產走勢)
     asset_ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
     asset_history = []
     if asset_ws:
         raw_rows = asset_ws.get_all_values()
         if len(raw_rows) > 1:
             for row in raw_rows[1:]:
-                if len(row) >= 2: # 至少要有日期和淨值
+                if len(row) >= 2:
                     asset_history.append({
-                        'Date': row[0],
+                        'Date': str(row[0]).strip(),
                         'NetAsset': row[1],
                         'Principal': row[2] if len(row) > 2 else row[1]
                     })
@@ -148,7 +147,6 @@ def record_asset_history(client, username, net_asset, principal):
     if ws:
         today = datetime.now().strftime('%Y-%m-%d')
         all_vals = ws.get_all_values()
-        # 簡單邏輯：如果最後一筆是今天，則更新；否則新增
         if len(all_vals) > 1 and all_vals[-1][0] == today:
             row_idx = len(all_vals)
             ws.update(f"B{row_idx}:C{row_idx}", [[net_asset, principal]])
@@ -427,7 +425,8 @@ st.subheader("📈 績效表現")
 # [Fix] 更強健的數值解析邏輯，處理 $ 符號與逗號
 def safe_parse_profit(val):
     try:
-        s = str(val).replace(',', '').replace('$', '').replace(' ', '')
+        if isinstance(val, (int, float)): return float(val)
+        s = str(val).replace(',', '').replace('$', '').replace(' ', '').replace('+', '')
         return float(s)
     except: return 0.0
 
@@ -485,7 +484,9 @@ with tab3:
         
         # 安全解析數值，處理可能的空白或異常字元
         def safe_float(x):
-            try: return float(str(x).replace(',', ''))
+            try: 
+                s = str(x).replace(',', '').replace('$', '').replace(' ', '')
+                return float(s)
             except: return 0.0
             
         df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float)
