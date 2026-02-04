@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v6.1 (Yahoo First & Price Memory)"
+APP_VERSION = "v6.2 (UI Restore & Column Fix)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -55,7 +55,7 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
         st.sidebar.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
         return None
 
-# --- 資料讀寫核心 (含價格記憶) ---
+# --- 資料讀寫核心 ---
 def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
@@ -81,7 +81,6 @@ def load_data(client, username):
                 try: lots = json.loads(r.get('Lots_Data', '[]'))
                 except: lots = []
                 
-                # 自動修復邏輯：優先從 Lots 計算
                 if lots:
                     calc_shares = sum(float(l.get('s', 0)) for l in lots)
                     calc_cost_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
@@ -92,15 +91,13 @@ def load_data(client, username):
                     final_s = clean_num(r.get('Shares', 0))
                     final_c = clean_num(r.get('AvgCost', 0))
                 
-                # [New Feature] 讀取上次存檔的價格 (LastPrice)
-                # 如果 Excel 沒這欄位，預設為 0
                 saved_last_p = clean_num(r.get('LastPrice', 0))
                 
                 h_data[code] = {
                     'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
                     's': final_s, 
                     'c': final_c,
-                    'last_p': saved_last_p, # 載入記憶價格
+                    'last_p': saved_last_p,
                     'lots': lots
                 }
         except Exception as e:
@@ -165,13 +162,11 @@ def save_data(client, username, data):
         acc_ws.clear()
         acc_ws.update('A1', [['Key', 'Value'], ['Cash', data['cash']], ['Principal', data['principal']], ['LastUpdate', data.get('last_update', '')], ['USDTWD', data.get('usdtwd', 32.5)]])
 
-    # 存庫存 - [New] 新增 LastPrice 欄位寫入
     user_ws = get_worksheet(client, f"User_{username}")
     if user_ws:
         headers = ['Code', 'Name', 'Exchange', 'Shares', 'AvgCost', 'Lots_Data', 'LastPrice']
         rows = [headers]
         for code, info in data.get('h', {}).items():
-            # 取得最新價格，若無則用成本 (但這應該是極少數)
             current_p = info.get('last_p', 0)
             if current_p == 0: current_p = info.get('c', 0)
             
@@ -179,7 +174,7 @@ def save_data(client, username, data):
                 code, info.get('n', ''), info.get('ex', ''),
                 float(info.get('s', 0)), float(info.get('c', 0)),
                 json.dumps(info.get('lots', []), ensure_ascii=False),
-                float(current_p) # 寫入 LastPrice
+                float(current_p)
             ])
         user_ws.clear()
         user_ws.update('A1', rows)
@@ -208,20 +203,17 @@ def get_audit_logs(client, username, limit=50):
         if len(vals) > 1: return vals[1:][-limit:][::-1]
     return []
 
-# --- 股價抓取核心 (Yahoo 優先策略) ---
+# --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
 def get_usdtwd():
     try:
         t = yf.Ticker("USDTWD=X")
-        # 使用 history 防止 fast_info 失敗
         return t.history(period="1d")['Close'].iloc[-1]
     except: return 32.5
 
 def fetch_stock_price_robust(code, exchange=''):
     code = str(code).strip().upper()
     is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
-    
-    # 建立 Yahoo Finance 代碼
     yf_code = code
     if is_tw and '.TW' not in yf_code and '.TWO' not in yf_code: yf_code = f"{code}.TW"
     
@@ -229,16 +221,13 @@ def fetch_stock_price_robust(code, exchange=''):
     prev_close = 0.0
     fetched_name = code
 
-    # [Strategy Shift] 優先使用 Yahoo Finance (對 Cloud IP 更穩定)
     try:
         t = yf.Ticker(yf_code)
-        # 嘗試 history (最穩)
         hist = t.history(period="5d")
         if not hist.empty:
             price = hist['Close'].iloc[-1]
             prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else price
         
-        # 嘗試獲取名稱
         try: fetched_name = t.info.get('shortName') or t.info.get('longName') or code
         except: pass
         
@@ -248,7 +237,6 @@ def fetch_stock_price_robust(code, exchange=''):
             return {'p': price, 'chg': chg, 'pct': pct, 'n': fetched_name, 'src': 'Yahoo'}
     except Exception: pass
 
-    # [Backup] TWSE API (Yahoo 失敗才用)
     if is_tw:
         clean_code = code.replace('.TW', '').replace('.TWO', '')
         queries = [f"tse_{clean_code}.tw", f"otc_{clean_code}.tw"]
@@ -256,7 +244,7 @@ def fetch_stock_price_robust(code, exchange=''):
             ts = int(time.time() * 1000)
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={'|'.join(queries)}&json=1&delay=0&_={ts}"
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-            r = requests.get(url, headers=headers, verify=False, timeout=3) # 短超時
+            r = requests.get(url, headers=headers, verify=False, timeout=3)
             data = r.json()
             if 'msgArray' in data:
                 for item in data['msgArray']:
@@ -428,20 +416,15 @@ table_rows = []
 for code, info in data['h'].items():
     if info['s'] < 0.01: continue 
     
-    # [Core Fix] 優先使用即時報價 -> 其次使用記憶價格(LastPrice) -> 最後才用成本
     q = quotes.get(code)
     if q and q['p'] > 0:
         curr_p = q['p']
-        # 更新記憶 (Session級別)
         info['last_p'] = curr_p 
     else:
-        # Fallback 1: 記憶價格 (從Sheet載入)
         curr_p = info.get('last_p', 0)
-        # Fallback 2: 成本價 (如果完全是新的)
         if curr_p == 0: curr_p = info.get('c', 0)
-        q = {'chg': 0, 'pct': 0, 'n': info.get('n', code)} # 假報價物件
+        q = {'chg': 0, 'pct': 0, 'n': info.get('n', code)}
 
-    # 更新名稱
     if q.get('n') and q['n'] != code: info['n'] = q['n']
     
     s_code = str(code).upper()
@@ -464,11 +447,15 @@ for code, info in data['h'].items():
     p_roi = (p_gain / (cost_val - stock_debt)) if (cost_val - stock_debt) > 0 else 0
     
     table_rows.append({
-        "代碼": code, "名稱": info.get('n'), "股數": qty, 
+        "股票代碼": code, "公司名稱": info.get('n'), "股數": qty, 
         "成本": cost, "現價": curr_p,
-        "日損益": q.get('chg', 0), "日漲跌幅": q.get('pct', 0) / 100,
-        "總損益": p_gain, "報酬率": p_roi, "市值": mkt_val, "mkt_val_raw": mkt_val
+        "日損益%": q.get('pct', 0) / 100, "日損益": q.get('chg', 0) * qty * rate,
+        "總損益%": p_roi, "總損益": p_gain, "市值": mkt_val, "mkt_val_raw": mkt_val
     })
+
+# 補算佔比
+for row in table_rows:
+    row["占比"] = (row["mkt_val_raw"] / total_mkt) if total_mkt > 0 else 0
 
 net_asset = data['cash'] + total_mkt - total_debt
 roi_pct = ((net_asset - data['principal']) / data['principal'] * 100) if data['principal'] else 0
@@ -479,18 +466,17 @@ if st.button("🔄 更新即時股價", type="primary", use_container_width=True
         data['usdtwd'] = get_usdtwd()
         st.session_state.quotes = update_prices_batch(data['h'])
         data['last_update'] = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
-        save_data(client, username, data) # 這步會把抓到的股價存入 LastPrice
+        save_data(client, username, data)
         record_asset_history(client, username, net_asset, data['principal'])
         st.rerun()
 
-# --- 恢復完整面板 (資產 + 績效) ---
+# --- 恢復完整面板 (資產 + 績效) - 依照截圖 1769771987886.jpg ---
 st.subheader("🏦 資產概況")
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4 = st.columns(4)
 k1.metric("💰 淨資產", f"${net_asset:,.0f}")
 k2.metric("💵 現金餘額", f"${data['cash']:,.0f}")
 k3.metric("📊 證券市值", f"${total_mkt:,.0f}")
 k4.metric("📉 投入本金", f"${data['principal']:,.0f}")
-k5.metric("💳 融資金額", f"${total_debt:,.0f}")
 
 st.subheader("📈 績效表現")
 
@@ -502,13 +488,13 @@ def safe_sum_profit(val):
     except: return 0.0
 
 total_realized = sum(safe_sum_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
-day_pct = (day_gain / (total_mkt - day_gain)) * 100 if (total_mkt - day_gain) > 0 else 0
+total_profit_all = (net_asset - data['principal']) # 總損益 (含已實現)
 
 kp1, kp2, kp3, kp4 = st.columns(4)
-kp1.metric("📅 今日損益", f"${day_gain:,.0f}", f"{day_pct:+.2f}%")
-kp2.metric("💰 總損益 (含已實現)", f"${(net_asset - data['principal']):,.0f}")
-kp3.metric("🏆 總報酬率", f"{roi_pct:+.2f}%")
-kp4.metric("📥 已實現損益", f"${total_realized:,.0f}")
+kp1.metric("📅 今日損益", f"${day_gain:,.0f}")
+kp2.metric("💰 總損益 (含已實現)", f"${total_profit_all:,.0f}")
+kp3.metric("🏆 總報酬率 (ROI)", f"{roi_pct:+.2f}%")
+kp4.metric("📥 其中已實現", f"${total_realized:,.0f}")
 
 st.markdown("---")
 
@@ -522,12 +508,17 @@ def style_color(v):
 with tab1:
     if table_rows:
         df = pd.DataFrame(table_rows).drop(columns=['mkt_val_raw'])
+        # 依照截圖順序重排
+        cols = ["股票代碼", "公司名稱", "股數", "成本", "現價", "日損益%", "日損益", "總損益%", "總損益", "市值", "占比"]
+        df = df[cols]
+        
         st.dataframe(
             df.style.format({
                 "股數": "{:,.0f}", "成本": "{:,.2f}", "現價": "{:.2f}",
-                "日損益": "{:+.2f}", "日漲跌幅": "{:+.2%}",
-                "總損益": "{:+,.0f}", "報酬率": "{:+.2%}", "市值": "{:,.0f}"
-            }).map(style_color, subset=['日損益', '日漲跌幅', '總損益', '報酬率']),
+                "日損益%": "{:+.2%}", "日損益": "{:+,.0f}",
+                "總損益%": "{:+.2%}", "總損益": "{:+,.0f}", "市值": "{:,.0f}",
+                "占比": "{:.1%}"
+            }).map(style_color, subset=['日損益%', '日損益', '總損益%', '總損益']),
             use_container_width=True, hide_index=True, height=500
         )
     else:
@@ -537,9 +528,9 @@ with tab2:
     if table_rows:
         df_tree = pd.DataFrame(table_rows)
         fig = px.treemap(
-            df_tree, path=['代碼'], values='mkt_val_raw', color='日漲跌幅',
+            df_tree, path=['股票代碼'], values='mkt_val_raw', color='日損益%',
             color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
-            hover_data=['名稱', '總損益', '報酬率']
+            hover_data=['公司名稱', '總損益', '總損益%']
         )
         fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
         st.plotly_chart(fig, use_container_width=True)
