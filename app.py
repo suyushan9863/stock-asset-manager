@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v2.8 (Stability Fix)"
+APP_VERSION = "v2.9 (Hotfix 2)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -103,7 +103,6 @@ def get_price_sync_sheet(client):
         worksheet_name = "Price_Sync"
         try:
             sheet = spreadsheet.worksheet(worksheet_name)
-        # [Fix] 確保這邊的 Exception 寫法正確
         except gspread.exceptions.WorksheetNotFound:
             sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="100", cols="5")
         return sheet
@@ -453,7 +452,9 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
 
         if is_tw:
             prefix = 'otc' if ex in ['otc', 'TWO'] else 'tse'
-            tw_query.append(f"{prefix}_{code}.tw")
+            # --- [v2.9 Fix] 移除多餘後綴，防止 tse_2330.TW.tw 的錯誤查詢 ---
+            clean_code = s_code.upper().replace('.TW', '').replace('.TWO', '')
+            tw_query.append(f"{prefix}_{clean_code}.tw")
         else:
             other_query_dict[code] = info
 
@@ -526,7 +527,6 @@ def update_dashboard_data(use_realtime=True):
         for code, info in h.items():
             if not info: continue 
 
-            # [Safe Mode] 移除了這裡的 resolve_stock_info 呼叫，避免迴圈內 API 阻塞
             if not info.get('ex'):
                 if str(code)[0].isdigit(): info['ex'] = 'tse'
 
@@ -731,10 +731,13 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
+    **v2.9 Hotfix 2**
+    1.  **查詢格式修正**: 修復當股票代碼已包含 `.TW` 後綴時 (如 `2327.TW`)，系統重複添加後綴導致查詢失敗的問題。
+    2.  **即時報價恢復**: 修正後應可正常抓取現價，解決日損益顯示為 0 的狀況。
+    
     **v2.8 Stability Fix**
     1.  **修復語法錯誤**: 修正 `except` 敘述不完整的 SyntaxError。
     2.  **安全性增強**: 核心計算邏輯加入 Try-Catch 保護，防止畫面白屏。
-    3.  **效能優化**: 移除儀表板更新時的阻塞式 API 呼叫。
     """)
 
 # --- 主程式 ---
