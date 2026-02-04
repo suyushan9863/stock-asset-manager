@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.1 (Headers & FX Fix)"
+APP_VERSION = "v4.2 (Pro UI Restored)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -48,7 +48,7 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
 
 # --- 資料讀寫核心 ---
 def load_data(client, username):
-    default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': []}
+    default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
     
     # 讀取 User Sheet (庫存)
@@ -74,9 +74,13 @@ def load_data(client, username):
         for row in acc_ws.get_all_values():
             if len(row) >= 2: acc_data[row[0]] = row[1]
 
-    # 讀取 History (已實現)
+    # 讀取 Realized History (已實現損益)
     hist_ws = get_worksheet(client, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
     hist_data = hist_ws.get_all_records() if hist_ws else []
+
+    # 讀取 Asset History (資產走勢)
+    asset_ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
+    asset_history = asset_ws.get_all_records() if asset_ws else []
 
     return {
         'h': h_data,
@@ -84,7 +88,8 @@ def load_data(client, username):
         'principal': float(acc_data.get('Principal', 0)),
         'last_update': acc_data.get('LastUpdate', ''),
         'usdtwd': float(acc_data.get('USDTWD', 32.5)),
-        'history': hist_data
+        'history': hist_data,
+        'asset_history': asset_history
     }
 
 def save_data(client, username, data):
@@ -116,7 +121,26 @@ def log_transaction(client, username, action, code, amount, shares, memo=""):
         ts = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y/%m/%d %H:%M:%S')
         ws.append_row([ts, action, code, amount, shares, memo])
 
-# --- 股價抓取核心 (v4.1 修復版) ---
+def record_asset_history(client, username, net_asset, principal):
+    ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
+    if ws:
+        today = datetime.now().strftime('%Y-%m-%d')
+        all_vals = ws.get_all_values()
+        # 簡單邏輯：如果最後一筆是今天，則更新；否則新增
+        if len(all_vals) > 1 and all_vals[-1][0] == today:
+            row_idx = len(all_vals)
+            ws.update(f"B{row_idx}:C{row_idx}", [[net_asset, principal]])
+        else:
+            ws.append_row([today, net_asset, principal])
+
+def get_audit_logs(client, username, limit=50):
+    ws = get_worksheet(client, f"Audit_{username}")
+    if ws:
+        vals = ws.get_all_values()
+        if len(vals) > 1: return vals[1:][-limit:][::-1]
+    return []
+
+# --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
 def get_usdtwd():
     try:
@@ -125,87 +149,56 @@ def get_usdtwd():
     except: return 32.5
 
 def fetch_stock_price_robust(code, exchange=''):
-    """
-    單一股票查價函式：
-    修復重點：
-    1. 加入 User-Agent Header 解決 TWSE 拒絕連線問題 (解決股價=成本問題)。
-    2. 針對 KY 股 (如 4958) 的 'z=-' 情況進行備援讀取。
-    """
     code = str(code).strip().upper()
-    # 判定是否為台股：支援 .TW, .TWO 或 純數字
     is_tw = (exchange in ['tse', 'otc', 'TW', 'TWO']) or \
             (code.endswith('.TW')) or (code.endswith('.TWO')) or \
             (code.replace('.TW','').replace('.TWO','').isdigit())
     
-    # --- 方法 A: TWSE API (僅限台股) ---
     if is_tw:
         clean_code = code.replace('.TW', '').replace('.TWO', '')
         queries = [f"tse_{clean_code}.tw", f"otc_{clean_code}.tw"]
-        
         try:
             ts = int(time.time() * 1000)
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={'|'.join(queries)}&json=1&delay=0&_={ts}"
-            # [Fix 1] 必須加入 Header，否則會被證交所擋掉
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
             r = requests.get(url, headers=headers, verify=False, timeout=5)
             data = r.json()
-            
             if 'msgArray' in data:
                 for item in data['msgArray']:
-                    if item.get('n'): # 確保有抓到名稱
-                        # [Fix 2] 處理無成交價的情況 (KY股常見)
+                    if item.get('n'): 
                         z = item.get('z', '-')
-                        if z == '-': z = item.get('b', '').split('_')[0] # 試最佳買價
-                        if z == '-' or z == '': z = item.get('a', '').split('_')[0] # 試最佳賣價
-                        if z == '-' or z == '': z = item.get('y', '0') # 試昨收
-                        
+                        if z == '-': z = item.get('b', '').split('_')[0]
+                        if z == '-' or z == '': z = item.get('a', '').split('_')[0]
+                        if z == '-' or z == '': z = item.get('y', '0')
                         try: price = float(z)
                         except: price = 0.0
-                        
                         y_close = float(item.get('y', 0))
                         chg = price - y_close if price > 0 else 0
                         pct = (chg / y_close * 100) if y_close > 0 else 0
-                        
                         return {'p': price, 'chg': chg, 'pct': pct, 'n': item.get('n', code)}
-        except Exception:
-            pass # 失敗則進入 Yahoo Fallback
+        except Exception: pass
 
-    # --- 方法 B: Yahoo Finance ---
     try:
         yf_code = code
-        if is_tw and '.TW' not in yf_code and '.TWO' not in yf_code:
-            yf_code = f"{code}.TW"
-            
+        if is_tw and '.TW' not in yf_code and '.TWO' not in yf_code: yf_code = f"{code}.TW"
         t = yf.Ticker(yf_code)
-        price = 0.0
-        prev_close = 0.0
-        
-        # 嘗試 fast_info
+        price = 0.0; prev_close = 0.0
         if hasattr(t, 'fast_info') and 'last_price' in t.fast_info:
             price = t.fast_info['last_price']
             prev_close = t.fast_info.get('previous_close', 0)
-        
-        # 嘗試 history
         if price == 0 or price is None:
             hist = t.history(period="5d")
             if not hist.empty:
                 price = hist['Close'].iloc[-1]
                 prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else price
-
         if price and price > 0:
             chg = price - prev_close
             pct = (chg / prev_close * 100) if prev_close > 0 else 0
             name = code
             try: name = t.info.get('shortName') or t.info.get('longName') or code
             except: pass
-            
             return {'p': price, 'chg': chg, 'pct': pct, 'n': name}
-            
-    except Exception:
-        pass
-        
+    except Exception: pass
     return {'p': 0, 'chg': 0, 'pct': 0, 'n': code}
 
 def update_prices_batch(portfolio):
@@ -219,6 +212,13 @@ def update_prices_batch(portfolio):
         progress_bar.progress((i + 1) / total)
     progress_bar.empty()
     return results
+
+@st.dialog("📋 異動歷程")
+def show_audit_log_modal(logs):
+    if logs:
+        st.dataframe(pd.DataFrame(logs, columns=['時間', '動作', '代碼', '金額', '股數', '備註']), use_container_width=True, hide_index=True)
+    else:
+        st.info("無紀錄")
 
 # --- 主程式 ---
 if 'current_user' not in st.session_state: st.session_state.current_user = None
@@ -273,11 +273,9 @@ with st.sidebar:
         if st.button("確認買入", type="primary"):
             if b_code and b_price > 0:
                 info = fetch_stock_price_robust(b_code)
-                # 判斷是否為台股 (包含 .TW 結尾)
                 is_tw = info['p'] > 0 and ('.TW' in b_code or '.TWO' in b_code or b_code.isdigit())
                 ex_type = 'tse' if is_tw else 'US'
                 rate = 1.0 if is_tw else get_usdtwd()
-                
                 cost_twd = b_qty * b_price * rate
                 cash_need = cost_twd * b_ratio
                 debt = cost_twd - cash_need
@@ -292,7 +290,6 @@ with st.sidebar:
                     tot_c = sum(l['s'] * l['p'] for l in h['lots'])
                     h['s'] = tot_s
                     h['c'] = tot_c / tot_s if tot_s else 0
-                    
                     save_data(client, username, data)
                     log_transaction(client, username, "買入", b_code, b_price, b_qty)
                     st.success(f"買入 {b_code} 成功"); time.sleep(1); st.rerun()
@@ -336,15 +333,13 @@ with st.sidebar:
                 log_transaction(client, username, "賣出", s_code, s_price, s_qty)
                 st.success("賣出成功"); time.sleep(1); st.rerun()
 
+    if st.button("📋 異動歷程"):
+        logs = get_audit_logs(client, username)
+        show_audit_log_modal(logs)
+
 st.title(f"📈 資產管家")
 
-if st.button("🔄 更新即時股價", type="primary", use_container_width=True):
-    with st.spinner("更新中 (v4.1 Headers Fix)..."):
-        data['usdtwd'] = get_usdtwd()
-        st.session_state.quotes = update_prices_batch(data['h'])
-        data['last_update'] = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
-        save_data(client, username, data)
-
+# 準備計算資料
 quotes = st.session_state.get('quotes', {})
 total_mkt = 0; total_cost = 0; total_debt = 0; day_gain = 0
 table_rows = []
@@ -353,7 +348,6 @@ for code, info in data['h'].items():
     q = quotes.get(code, {'p': info['c'], 'chg': 0, 'pct': 0, 'n': info.get('n', code)})
     if q['n'] and q['n'] != code: info['n'] = q['n']
     
-    # [Fix 3] 嚴謹的匯率判斷：包含 .TW / .TWO 都算台股，避免誤判為美股 x32.5
     s_code = str(code).upper()
     is_tw = (info.get('ex') in ['tse', 'otc', 'TW', 'TWO']) or \
             s_code.endswith('.TW') or s_code.endswith('.TWO') or \
@@ -381,11 +375,21 @@ for code, info in data['h'].items():
         "代碼": code, "名稱": info.get('n'), "股數": qty, 
         "成本": cost, "現價": curr_p,
         "日損益": q.get('chg', 0), "日漲跌幅": q.get('pct', 0) / 100,
-        "總損益": p_gain, "報酬率": p_roi, "市值": mkt_val
+        "總損益": p_gain, "報酬率": p_roi, "市值": mkt_val, "mkt_val_raw": mkt_val
     })
 
 net_asset = data['cash'] + total_mkt - total_debt
 roi_pct = ((net_asset - data['principal']) / data['principal'] * 100) if data['principal'] else 0
+
+# 更新股價與紀錄
+if st.button("🔄 更新即時股價", type="primary", use_container_width=True):
+    with st.spinner("更新中..."):
+        data['usdtwd'] = get_usdtwd()
+        st.session_state.quotes = update_prices_batch(data['h'])
+        data['last_update'] = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
+        save_data(client, username, data)
+        record_asset_history(client, username, net_asset, data['principal']) # 記錄資產走勢
+        st.rerun()
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("淨資產", f"${net_asset:,.0f}", delta=f"{day_gain:,.0f} (今日)")
@@ -395,19 +399,60 @@ m4.metric("現金", f"${data['cash']:,.0f}")
 
 st.markdown("---")
 
-if table_rows:
-    df = pd.DataFrame(table_rows)
-    def style_color(v):
-        try: return 'color: red' if float(v) > 0 else 'color: green' if float(v) < 0 else ''
-        except: return ''
+# --- UI 頁籤恢復 ---
+tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
 
-    st.dataframe(
-        df.style.format({
-            "股數": "{:,.0f}", "成本": "{:,.2f}", "現價": "{:.2f}",
-            "日損益": "{:+.2f}", "日漲跌幅": "{:+.2%}",
-            "總損益": "{:+,.0f}", "報酬率": "{:+.2%}", "市值": "{:,.0f}"
-        }).map(style_color, subset=['日損益', '日漲跌幅', '總損益', '報酬率']),
-        use_container_width=True, hide_index=True, height=500
-    )
-else:
-    st.info("尚無庫存，請從左側新增。")
+def style_color(v):
+    try: return 'color: red' if float(v) > 0 else 'color: green' if float(v) < 0 else ''
+    except: return ''
+
+with tab1:
+    if table_rows:
+        df = pd.DataFrame(table_rows).drop(columns=['mkt_val_raw'])
+        st.dataframe(
+            df.style.format({
+                "股數": "{:,.0f}", "成本": "{:,.2f}", "現價": "{:.2f}",
+                "日損益": "{:+.2f}", "日漲跌幅": "{:+.2%}",
+                "總損益": "{:+,.0f}", "報酬率": "{:+.2%}", "市值": "{:,.0f}"
+            }).map(style_color, subset=['日損益', '日漲跌幅', '總損益', '報酬率']),
+            use_container_width=True, hide_index=True, height=500
+        )
+    else:
+        st.info("尚無庫存，請從左側新增。")
+
+with tab2:
+    if table_rows:
+        df_tree = pd.DataFrame(table_rows)
+        fig = px.treemap(
+            df_tree, path=['代碼'], values='mkt_val_raw', color='日漲跌幅',
+            color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
+            hover_data=['名稱', '總損益', '報酬率']
+        )
+        fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("尚無資料")
+
+with tab3:
+    hist_data = data.get('asset_history', [])
+    if hist_data:
+        df_h = pd.DataFrame(hist_data)
+        df_h['Date'] = pd.to_datetime(df_h['Date'])
+        df_h['NetAsset'] = pd.to_numeric(df_h['NetAsset'])
+        df_h['Principal'] = pd.to_numeric(df_h['Principal'])
+        df_h['Profit'] = df_h['NetAsset'] - df_h['Principal']
+        
+        fig_trend = go.Figure()
+        fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['NetAsset'], name='淨資產', fill='tozeroy'))
+        fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['Principal'], name='本金', line=dict(dash='dot')))
+        st.plotly_chart(fig_trend, use_container_width=True)
+    else:
+        st.info("尚無歷史資產資料 (請執行一次更新即時股價以建立紀錄)")
+
+with tab4:
+    realized = data.get('history', [])
+    if realized:
+        df_r = pd.DataFrame(realized)
+        st.dataframe(df_r, use_container_width=True, hide_index=True)
+    else:
+        st.info("尚無已實現損益紀錄")
