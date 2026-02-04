@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v3.5 (Hotfix 4 - State Repair)"
+APP_VERSION = "v3.5 (Hotfix 5 - 4958 Fix)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -323,72 +323,154 @@ def get_usdtwd():
         return 32.5
     except: return 32.5
 
-# --- [v3.4] Hybrid Fetcher (TWSE + Yahoo Fallback) ---
+def record_history(client, username, net_asset, principal):
+    # 這裡可以實作將每日淨值寫入 Hist Sheet 的功能
+    try:
+        h_sheet = get_user_history_sheet(client, username)
+        if h_sheet:
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            all_vals = h_sheet.get_all_values()
+            # 簡單檢查最後一筆是否為今天，如果是則更新，否則新增
+            if len(all_vals) > 1 and all_vals[-1][0] == today_str:
+                # 更新最後一行
+                last_row_idx = len(all_vals)
+                h_sheet.update(f'B{last_row_idx}:C{last_row_idx}', [[net_asset, principal]])
+            else:
+                h_sheet.append_row([today_str, net_asset, principal])
+    except: pass
+
+def get_recent_audit_logs(client, username, limit=50):
+    try:
+        sheet = get_audit_sheet(client, username)
+        if sheet:
+            vals = sheet.get_all_values()
+            if len(vals) > 1:
+                return vals[1:][-limit:][::-1] # 取最後N筆並反轉
+    except: pass
+    return []
+
+@st.dialog("📋 異動歷程")
+def show_audit_log_modal(logs):
+    if logs:
+        df_log = pd.DataFrame(logs, columns=['時間', '動作', '代碼', '金額', '股數', '備註'])
+        st.dataframe(df_log, use_container_width=True, hide_index=True)
+    else:
+        st.info("無近期異動紀錄")
+
+# --- [v3.5 Hotfix] Robust Hybrid Fetcher (修正 4958 問題) ---
 def fetch_prices_hybrid(tw_codes):
     """
-    雙引擎查價：先用證交所 API，失敗則自動切換到 Yahoo Finance。
+    雙引擎查價：證交所 API (具備自動修正 TSE/OTC 前綴功能) + Yahoo Finance Fallback
     """
     if not tw_codes: return {}
     results = {}
     
-    # 1. 嘗試證交所 API (Primary)
-    try:
-        query_str = "|".join(tw_codes)
-        timestamp = int(time.time() * 1000)
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={query_str}&json=1&delay=0&_={timestamp}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-        
-        res = requests.get(url, headers=headers, verify=False, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            if 'msgArray' in data:
-                for item in data['msgArray']:
-                    c = item.get('c', '')
-                    n = item.get('n', '')
-                    price_str = item.get('z', '-')
-                    if price_str == '-':
-                        bid = item.get('b', '').split('_')[0]
-                        ask = item.get('a', '').split('_')[0]
-                        if bid and bid != '-' and bid != '0.00': price_str = bid
-                        elif ask and ask != '-' and ask != '0.00': price_str = ask
-                    
-                    price = float(price_str) if price_str and price_str != '-' else 0.0
-                    y = float(item.get('y', 0.0))
-                    chg = price - y if price > 0 else 0.0
-                    pct = (chg / y * 100) if y > 0 else 0.0
-                    
-                    if price > 0:
-                        res_obj = {'p': price, 'chg': chg, 'chg_pct': pct, 'n': n, 'realtime': True}
-                        results[c] = res_obj
-                        # Map variants
-                        results[f"{c}.TW"] = res_obj
-                        results[f"{c}.TWO"] = res_obj
-    except: pass
-
-    # 2. 檢查哪些失敗 (Missing or Zero Price)
-    missing_codes = []
-    for q_code in tw_codes:
-        # Extract pure code: tse_2330.tw -> 2330
-        pure_code = q_code.split('_')[1].split('.')[0]
-        if pure_code not in results or results[pure_code]['p'] == 0:
-            missing_codes.append(pure_code + ".TW") # Try .TW first
-
-    # 3. 啟動 Yahoo Finance Backup (Secondary)
-    if missing_codes:
+    # 1. 建立查詢字串 (第一次嘗試)
+    query_str = "|".join(tw_codes)
+    
+    def call_twse_api(q_str):
+        """ 內部函式：呼叫證交所 API """
         try:
-            yf_data = yf.download(missing_codes, period="1d", progress=False)
-            for m_code in missing_codes:
+            timestamp = int(time.time() * 1000)
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={q_str}&json=1&delay=0&_={timestamp}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            res = requests.get(url, headers=headers, verify=False, timeout=4)
+            if res.status_code == 200:
+                return res.json()
+        except: pass
+        return {}
+
+    # 執行第一次查詢
+    data = call_twse_api(query_str)
+    
+    # 解析資料的 Helper function
+    def parse_msg_array(msg_array):
+        parsed = {}
+        for item in msg_array:
+            c = item.get('c', '')
+            n = item.get('n', '')
+            price_str = item.get('z', '-')
+            if price_str == '-':
+                bid = item.get('b', '').split('_')[0]
+                ask = item.get('a', '').split('_')[0]
+                if bid and bid != '-' and bid != '0.00': price_str = bid
+                elif ask and ask != '-' and ask != '0.00': price_str = ask
+            
+            try:
+                price = float(price_str) if price_str and price_str != '-' else 0.0
+            except: price = 0.0
+            
+            if price > 0:
+                y = float(item.get('y', 0.0))
+                chg = price - y if price > 0 else 0.0
+                pct = (chg / y * 100) if y > 0 else 0.0
+                res_obj = {'p': price, 'chg': chg, 'chg_pct': pct, 'n': n, 'realtime': True}
+                parsed[c] = res_obj
+                # 建立多種 Key 對應，確保對應得到
+                parsed[f"{c}.TW"] = res_obj
+                parsed[f"{c}.TWO"] = res_obj
+        return parsed
+
+    if 'msgArray' in data:
+        results.update(parse_msg_array(data['msgArray']))
+
+    # 2. 自動修正機制 (Auto-Correction)
+    # 檢查哪些代碼沒抓到資料，嘗試交換前綴 (tse <-> otc)
+    retry_codes = []
+    
+    for q_code in tw_codes:
+        # q_code 格式範例: tse_4958.tw
+        pure_code = q_code.split('_')[1].split('.')[0] # 4958
+        
+        # 如果這個純代碼沒在結果中，或者價格為 0，代表可能前綴錯了
+        if pure_code not in results or results[pure_code]['p'] == 0:
+            if 'tse_' in q_code:
+                new_q = q_code.replace('tse_', 'otc_')
+                retry_codes.append(new_q)
+            elif 'otc_' in q_code:
+                new_q = q_code.replace('otc_', 'tse_')
+                retry_codes.append(new_q)
+
+    # 如果有需要重試的代碼，進行第二次 API 呼叫
+    if retry_codes:
+        retry_query = "|".join(retry_codes)
+        data_retry = call_twse_api(retry_query)
+        if 'msgArray' in data_retry:
+            retry_results = parse_msg_array(data_retry['msgArray'])
+            results.update(retry_results) # 合併結果
+
+    # 3. 檢查最終遺漏 (Missing) 並啟動 Yahoo Finance Backup
+    missing_for_yahoo = []
+    for q_code in tw_codes:
+        pure_code = q_code.split('_')[1].split('.')[0]
+        # 經過兩輪嘗試還是 0，才去 Yahoo
+        if pure_code not in results or results[pure_code]['p'] == 0:
+            # 優先嘗試 .TW (Yahoo 通常 4958.TW 抓得到，4958.TWO 抓不到)
+            missing_for_yahoo.append(pure_code + ".TW") 
+
+    if missing_for_yahoo:
+        try:
+            # yfinance 有時對 .TWO 支援度差，但對 .TW 支援度好
+            yf_data = yf.download(missing_for_yahoo, period="1d", progress=False)
+            
+            # 處理單一檔股票與多檔股票的 DataFrame 結構差異
+            is_single = len(missing_for_yahoo) == 1
+            
+            for m_code in missing_for_yahoo:
                 pure = m_code.replace('.TW', '')
                 try:
-                    if len(missing_codes) == 1:
+                    if is_single:
+                        # 單檔股票，yf_data['Close'] 是 Series
                         last_p = float(yf_data['Close'].iloc[-1])
                     else:
+                        # 多檔股票，yf_data['Close'][m_code] 是 Series
                         last_p = float(yf_data['Close'][m_code].iloc[-1])
                     
-                    # Fallback object
-                    results[pure] = {'p': last_p, 'chg': 0, 'chg_pct': 0, 'n': pure, 'realtime': False}
-                    results[f"{pure}.TW"] = results[pure]
-                    results[f"{pure}.TWO"] = results[pure]
+                    if last_p > 0:
+                        res_obj = {'p': last_p, 'chg': 0, 'chg_pct': 0, 'n': pure, 'realtime': False}
+                        results[pure] = res_obj
+                        results[f"{pure}.TW"] = res_obj
+                        results[f"{pure}.TWO"] = res_obj
                 except: pass
         except: pass
 
@@ -413,7 +495,7 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
 
     results = {}
     if tw_query:
-        # [v3.4] Use Hybrid Fetcher
+        # [v3.5] Use Hybrid Fetcher with Auto-Correction
         results = fetch_prices_hybrid(tw_query)
 
     if other_query_dict:
@@ -444,7 +526,7 @@ def update_dashboard_data(use_realtime=True):
     
     try:
         if use_realtime:
-            with st.spinner('正在同步市場數據 (台股雙引擎+美股)...'):
+            with st.spinner('正在同步市場數據 (台股雙引擎+自動修正+美股)...'):
                 usdtwd = get_usdtwd()
                 h = data.get('h', {})
                 batch_prices = get_batch_market_data(h, usdtwd)
@@ -538,7 +620,7 @@ def update_dashboard_data(use_realtime=True):
         roi_basis = current_principal if current_principal > 0 else 1
         total_roi_pct = (total_profit_sum / roi_basis) * 100
 
-        # [v3.4 New] Calculate Day PnL Percentage
+        # Calculate Day PnL Percentage
         prev_mkt_val = total_mkt_val - total_day_profit
         day_profit_pct = (total_day_profit / prev_mkt_val * 100) if prev_mkt_val > 0 else 0.0
 
@@ -644,13 +726,13 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
-    **v3.5 Hotfix 4**
-    1.  **State Repair**: 修正因舊版本快取導致的 KeyError，確保新功能平滑過渡。
+    **v3.5 Hotfix 5 (4958 Fix)**
+    1.  **自動修正 TSE/OTC**: 當遇到抓取失敗的台股 (如 4958 臻鼎-KY)，系統會自動交換交易所前綴重試，解決誤植問題。
+    2.  **State Repair**: 修正因舊版本快取導致的 KeyError。
     
     **v3.4 Hybrid Engine & PnL%**
-    1.  **台股雙引擎查價**: 優先使用 TWSE API，若失敗 (如 4958) 自動切換至 Yahoo Finance 補抓，確保價格不漏接。
-    2.  **今日損益百分比**: 新增顯示今日資產變動的百分比 (Today PnL %)。
-    3.  **已實現損益持久化**: 修正歷史紀錄重置問題。
+    1.  **台股雙引擎查價**: 優先使用 TWSE API。
+    2.  **今日損益百分比**: 新增顯示今日資產變動百分比。
     """)
 
 # --- 主程式 ---
