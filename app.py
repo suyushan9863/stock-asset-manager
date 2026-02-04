@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v6.2 (UI Restore & Column Fix)"
+APP_VERSION = "v6.3 (Trend & Benchmark)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -210,6 +210,25 @@ def get_usdtwd():
         t = yf.Ticker("USDTWD=X")
         return t.history(period="1d")['Close'].iloc[-1]
     except: return 32.5
+
+@st.cache_data(ttl=3600)
+def get_benchmark_data(start_date):
+    """抓取大盤數據 (0050, SPY, QQQ)"""
+    benchmarks = {}
+    target_tickers = [('0050.TW', '台灣50'), ('SPY', 'S&P 500'), ('QQQ', 'NASDAQ 100')]
+    
+    for code, name in target_tickers:
+        try:
+            t = yf.Ticker(code)
+            # 抓取歷史數據
+            hist = t.history(start=start_date)
+            if not hist.empty:
+                # 正規化為漲跌幅百分比 (以第一天為基準 0%)
+                start_val = hist['Close'].iloc[0]
+                if start_val > 0:
+                    benchmarks[name] = ((hist['Close'] / start_val) - 1) * 100
+        except: pass
+    return benchmarks
 
 def fetch_stock_price_robust(code, exchange=''):
     code = str(code).strip().upper()
@@ -470,7 +489,7 @@ if st.button("🔄 更新即時股價", type="primary", use_container_width=True
         record_asset_history(client, username, net_asset, data['principal'])
         st.rerun()
 
-# --- 恢復完整面板 (資產 + 績效) - 依照截圖 1769771987886.jpg ---
+# --- 恢復完整面板 (資產 + 績效) ---
 st.subheader("🏦 資產概況")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("💰 淨資產", f"${net_asset:,.0f}")
@@ -508,7 +527,6 @@ def style_color(v):
 with tab1:
     if table_rows:
         df = pd.DataFrame(table_rows).drop(columns=['mkt_val_raw'])
-        # 依照截圖順序重排
         cols = ["股票代碼", "公司名稱", "股數", "成本", "現價", "日損益%", "日損益", "總損益%", "總損益", "市值", "占比"]
         df = df[cols]
         
@@ -542,7 +560,7 @@ with tab3:
     if hist_data:
         df_h = pd.DataFrame(hist_data)
         df_h['Date'] = pd.to_datetime(df_h['Date'], errors='coerce')
-        df_h = df_h.dropna(subset=['Date'])
+        df_h = df_h.dropna(subset=['Date']).sort_values('Date')
         
         def safe_float_col(x):
             try: 
@@ -553,9 +571,32 @@ with tab3:
         df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float_col)
         df_h['Principal'] = df_h['Principal'].apply(safe_float_col)
         
+        # 切換按鈕
+        view_type = st.radio("顯示模式", ["💰 淨資產走勢 (金額)", "📈 累計報酬率比較 (%)"], horizontal=True)
+        
         fig_trend = go.Figure()
-        fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['NetAsset'], name='淨資產', fill='tozeroy'))
-        fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['Principal'], name='本金', line=dict(dash='dot')))
+        
+        if view_type == "💰 淨資產走勢 (金額)":
+            fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['NetAsset'], name='淨資產', fill='tozeroy', line=dict(color='#00CC96')))
+            fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['Principal'], name='投入本金', line=dict(color='#EF553B', dash='dot')))
+            fig_trend.update_layout(yaxis_title="金額 (TWD)")
+        else:
+            # 計算個人 ROI
+            df_h['ROI'] = ((df_h['NetAsset'] - df_h['Principal']) / df_h['Principal']) * 100
+            fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['ROI'], name='我的投資組合', line=dict(color='#00CC96', width=3)))
+            
+            # 抓取大盤比較
+            if not df_h.empty:
+                start_date = df_h['Date'].iloc[0].strftime('%Y-%m-%d')
+                benchmarks = get_benchmark_data(start_date)
+                
+                colors = ['#636EFA', '#AB63FA', '#FFA15A']
+                for i, (name, series) in enumerate(benchmarks.items()):
+                    fig_trend.add_trace(go.Scatter(x=series.index, y=series.values, name=name, line=dict(color=colors[i%len(colors)], width=1.5, dash='dot')))
+            
+            fig_trend.update_layout(yaxis_title="累計報酬率 (%)")
+
+        fig_trend.update_layout(hovermode="x unified", height=450)
         st.plotly_chart(fig_trend, use_container_width=True)
     else:
         st.info("尚無歷史資產資料 (請執行一次更新即時股價以建立紀錄)")
