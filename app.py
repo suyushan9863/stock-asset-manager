@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v3.0 (Final Polish)"
+APP_VERSION = "v3.1 (Hotfix 3 - Force Map)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -388,9 +388,9 @@ def get_usdtwd():
 
 def fetch_twse_realtime(codes):
     """
-    [v3.0] 股價抓取優化版：
-    1. 支援回傳公司名稱 'n'，解決顯示為代碼的問題。
-    2. 強化代碼比對。
+    [v3.1] 股價抓取優化版：
+    1. 支援回傳公司名稱 'n'。
+    2. 支援暴力映射 (Force Map)，解決後綴對不上的問題。
     """
     if not codes: return {}
     
@@ -416,8 +416,6 @@ def fetch_twse_realtime(codes):
             for item in data['msgArray']:
                 c = item.get('c', '')
                 ex = item.get('ex', '')
-                
-                # 擷取名稱 (v3.0 關鍵新增)
                 name = item.get('n', '')
                 
                 price_str = item.get('z', '-')
@@ -435,9 +433,9 @@ def fetch_twse_realtime(codes):
                 change_val = price - prev_close if price > 0 else 0.0
                 change_pct = (change_val / prev_close * 100) if prev_close > 0 else 0.0
 
-                # 將名稱 'n' 也放入回傳結構
                 res_obj = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'n': name, 'realtime': True}
 
+                # 原始映射
                 results[c] = res_obj
                 if ex == 'tse': results[f"{c}.TW"] = res_obj
                 elif ex == 'otc': results[f"{c}.TWO"] = res_obj
@@ -461,7 +459,6 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
 
         if is_tw:
             prefix = 'otc' if ex in ['otc', 'TWO'] else 'tse'
-            # [v3.0] 確保代碼乾淨 (移除後綴)
             clean_code = s_code.upper().replace('.TW', '').replace('.TWO', '')
             tw_query.append(f"{prefix}_{clean_code}.tw")
         else:
@@ -471,10 +468,18 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
     
     if tw_query:
         raw_tw_results = fetch_twse_realtime(tw_query)
+        # [v3.1 Fix] 暴力映射：將結果映射到所有可能的 Key
         for raw_k, v in raw_tw_results.items():
+            # 原始 Key
+            results[raw_k] = v
+            
+            # 純代碼 (4958)
             pure_k = raw_k.replace('.TW', '').replace('.TWO', '')
             results[pure_k] = v
-            results[raw_k] = v
+            
+            # 帶後綴 (4958.TW / 4958.TWO)
+            results[f"{pure_k}.TW"] = v
+            results[f"{pure_k}.TWO"] = v
 
     if other_query_dict:
         try:
@@ -545,14 +550,12 @@ def update_dashboard_data(use_realtime=True):
                 info['last_chg'] = market_info['chg']
                 info['last_chg_pct'] = market_info['chg_pct']
                 
-                # --- [v3.0] 自動修復名稱邏輯 ---
-                # 如果目前名稱是空的，或名稱跟代碼一樣，且 API 有抓到真名 -> 更新
+                # [v3.1] 自動修復名稱
                 current_name = info.get('n', '').strip()
                 fetched_name = market_info.get('n', '').strip()
                 
                 if (not current_name or current_name == str(code)) and fetched_name:
                     info['n'] = fetched_name
-                # ------------------------------
             else:
                 last_p = info.get('last_p', info.get('c', 0))
                 last_chg = info.get('last_chg', 0)
@@ -749,10 +752,10 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
-    **v3.0 Final Polish**
-    1.  **自動名稱修復 (Auto-Heal)**: 系統會嘗試從即時報價中抓取公司名稱，解決名稱顯示為代碼的問題。
-    2.  **查詢格式優化**: 內建代碼清洗邏輯 (Clean Suffix)，完美解決證交所查詢失敗問題。
-    3.  **會計邏輯確認**: 本金存提採用標準「淨投入」計算模式。
+    **v3.1 Hotfix 3 (Force Map)**
+    1.  **暴力代碼映射**: 強制將查詢結果映射到 `4958`、`4958.TW` 和 `4958.TWO`，解決臻鼎-KY (4958) 等股票因後綴問題抓不到價格的狀況。
+    2.  **公司名稱自動修復**: 系統會自動填入 API 回傳的正確公司名稱。
+    3.  **會計邏輯**: 確認本金存提邏輯為正確的淨投入計算。
     """)
 
 # --- 主程式 ---
@@ -893,9 +896,7 @@ with st.sidebar:
                     data['h'][final_code]['s'] = tot_s
                     data['h'][final_code]['c'] = tot_c_val / tot_s if tot_s else 0
                     data['h'][final_code]['lots'] = lots
-                    # [v3.0] 如果 resolve_stock_info 抓到的名稱是代碼，但我們有舊名稱，保留舊名稱
-                    if checked_name != final_code:
-                        data['h'][final_code]['n'] = checked_name
+                    if checked_name != final_code: data['h'][final_code]['n'] = checked_name
                     data['h'][final_code]['ex'] = ex_type
                 else:
                     data['h'][final_code] = {'s': shares_in, 'c': final_cost, 'n': checked_name, 'lots': [new_lot], 'ex': ex_type}
@@ -904,7 +905,6 @@ with st.sidebar:
                     data['h'][final_code]['last_p'] = fetched_p
                     data['h'][final_code]['last_chg'] = q_info.get('chg', 0)
                     data['h'][final_code]['last_chg_pct'] = q_info.get('chg_pct', 0)
-                    # [v3.0] 買入時即時更新名稱
                     if q_info.get('n'): data['h'][final_code]['n'] = q_info['n']
 
                 save_data(client, username, data)
