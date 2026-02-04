@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v3.2 (Persistence Update)"
+APP_VERSION = "v3.3 (Route Fix)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -62,7 +62,7 @@ def get_account_sheet(client, username):
         return sheet
     except: return None
 
-# [v3.2 New] 新增已實現損益工作表
+# [v3.2] 新增已實現損益工作表
 def get_realized_sheet(client, username):
     try:
         spreadsheet_name = st.secrets["spreadsheet_name"]
@@ -71,7 +71,6 @@ def get_realized_sheet(client, username):
         try:
             sheet = spreadsheet.worksheet(worksheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            # Date, Code, Name, Qty, BuyCost, SellRev, Profit, ROI
             sheet = spreadsheet.add_worksheet(title=worksheet_name, rows="1000", cols="8")
             sheet.append_row(['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
         return sheet
@@ -238,12 +237,11 @@ def load_data(client, username):
                     'lots': lots
                 }
         
-        # [v3.2 New] Load Realized History
+        # [v3.2] Load Realized History
         realized_data = []
         real_sheet = get_realized_sheet(client, username)
         if real_sheet:
             r_rows = real_sheet.get_all_records()
-            # Convert keys to match internal logic (d, code, name...)
             for r in r_rows:
                 realized_data.append({
                     'd': r.get('Date'), 'code': str(r.get('Code')), 'name': r.get('Name'),
@@ -356,10 +354,9 @@ def save_data(client, username, data):
             user_sheet.clear()
             user_sheet.update('A1', rows, value_input_option='USER_ENTERED')
         
-        # [v3.2 New] Save Realized History
+        # [v3.2] Save Realized History
         real_sheet = get_realized_sheet(client, username)
         if real_sheet:
-            # Overwrite realized sheet to ensure sync
             h_rows = [['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI']]
             for item in data.get('history', []):
                 h_rows.append([
@@ -428,9 +425,6 @@ def get_usdtwd():
     except: return 32.5
 
 def fetch_twse_realtime(codes):
-    """
-    [v3.1] 股價抓取優化版
-    """
     if not codes: return {}
     
     query_str = "|".join(codes)
@@ -455,8 +449,6 @@ def fetch_twse_realtime(codes):
             for item in data['msgArray']:
                 c = item.get('c', '')
                 ex = item.get('ex', '')
-                
-                # 擷取名稱
                 name = item.get('n', '')
                 
                 price_str = item.get('z', '-')
@@ -474,7 +466,6 @@ def fetch_twse_realtime(codes):
                 change_val = price - prev_close if price > 0 else 0.0
                 change_pct = (change_val / prev_close * 100) if prev_close > 0 else 0.0
 
-                # 將名稱 'n' 也放入回傳結構
                 res_obj = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'n': name, 'realtime': True}
 
                 results[c] = res_obj
@@ -496,11 +487,12 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
         ex = info.get('ex', '')
         s_code = str(code).strip()
         
-        is_tw = (ex in ['tse', 'otc', 'TW', 'TWO']) or (not ex and s_code.isdigit())
+        # [v3.3 Fix] 只要是純數字(如4958)或數字+後綴，強制視為台股
+        is_numeric_tw = s_code.replace('.TW', '').replace('.TWO', '').isdigit()
+        is_tw = (ex in ['tse', 'otc', 'TW', 'TWO']) or is_numeric_tw
 
         if is_tw:
             prefix = 'otc' if ex in ['otc', 'TWO'] else 'tse'
-            # [v3.0] 確保代碼乾淨 (移除後綴)
             clean_code = s_code.upper().replace('.TW', '').replace('.TWO', '')
             tw_query.append(f"{prefix}_{clean_code}.tw")
         else:
@@ -510,7 +502,6 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
     
     if tw_query:
         raw_tw_results = fetch_twse_realtime(tw_query)
-        # [v3.1 Fix] 暴力映射
         for raw_k, v in raw_tw_results.items():
             results[raw_k] = v
             pure_k = raw_k.replace('.TW', '').replace('.TWO', '')
@@ -578,8 +569,10 @@ def update_dashboard_data(use_realtime=True):
         for code, info in h.items():
             if not info: continue 
 
-            if not info.get('ex'):
-                if str(code)[0].isdigit(): info['ex'] = 'tse'
+            # [v3.3 Fix] 自動糾正錯誤的 Exchange 標記
+            s_code = str(code).strip()
+            if s_code.isdigit() and info.get('ex') not in ['tse', 'otc']:
+                info['ex'] = 'tse'
 
             if use_realtime:
                 market_info = batch_prices.get(code, {'p': info.get('c', 0), 'chg': 0, 'chg_pct': 0, 'n': ''})
@@ -587,7 +580,6 @@ def update_dashboard_data(use_realtime=True):
                 info['last_chg'] = market_info['chg']
                 info['last_chg_pct'] = market_info['chg_pct']
                 
-                # [v3.0] 自動修復名稱邏輯
                 current_name = info.get('n', '').strip()
                 fetched_name = market_info.get('n', '').strip()
                 
@@ -603,7 +595,6 @@ def update_dashboard_data(use_realtime=True):
             cur_p = fetched_price if fetched_price > 0.01 else float(info.get('c', 0))
             
             ex_val = info.get('ex', '')
-            s_code = str(code).strip()
             is_tw_stock = (ex_val in ['tse', 'otc', 'TW', 'TWO']) or (s_code and s_code[0].isdigit())
             rate = 1.0 if is_tw_stock else usdtwd
 
@@ -653,7 +644,6 @@ def update_dashboard_data(use_realtime=True):
         net_asset = (total_mkt_val + data['cash']) - total_debt
         unrealized_profit = total_mkt_val - total_cost_val
         
-        # [v3.2 Fix] 確保 history 存在 (防止初次載入為 None)
         total_realized_profit = sum(r.get('profit', 0) for r in (data.get('history') or []))
         total_profit_sum = unrealized_profit + total_realized_profit
         
@@ -790,10 +780,10 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
-    **v3.2 Persistence Update**
-    1.  **已實現損益持久化**: 新增專屬 `Realized` 工作表儲存已結清交易，修復歷史紀錄重啟後消失的問題。
-    2.  **暴力代碼映射 (v3.1)**: 強制映射解決 4958.TW 等後綴問題。
-    3.  **名稱自動修復 (v3.0)**: 系統自動填入正確公司名稱。
+    **v3.3 Route Fix (4958 Special)**
+    1.  **強制台股路由**: 強制所有數字代碼（包括 4958）使用 TWSE API 查詢，忽略 Sheet 中錯誤的 "US" 標記。
+    2.  **已實現損益持久化**: 保留 v3.2 的賣出紀錄保存功能。
+    3.  **暴力代碼映射**: 保留 v3.1 的後綴映射，確保抓到資料。
     """)
 
 # --- 主程式 ---
@@ -852,6 +842,7 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("💵 資金存提 (影響本金)"):
+        st.caption("存入資金：現金增加，本金增加。\n取出資金：現金減少，本金減少。")
         if "fund_op_val" not in st.session_state: st.session_state.fund_op_val = 0.0
         if st.session_state.get("reset_fund"):
              st.session_state.fund_op_val = 0.0
@@ -1010,7 +1001,6 @@ with st.sidebar:
                         data['h'][sell_code]['c'] = tc / ts if ts else 0
                     else: del data['h'][sell_code]
                     
-                    # [v3.2 Fix] History Appending Logic
                     if 'history' not in data: data['history'] = []
                     new_hist_record = {
                         'd': datetime.now().strftime('%Y-%m-%d'), 'code': sell_code,
