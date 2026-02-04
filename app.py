@@ -15,7 +15,14 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.5 (History & Chart Fix)"
+APP_VERSION = "v4.7 (Safe Float Parsing Fix)"
+
+# 自動清除舊快取與 Session State (解決資料結構不一致導致的 0 元問題)
+if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
+    st.cache_data.clear()
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.session_state.app_version = APP_VERSION
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -51,6 +58,16 @@ def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
     
+    # 定義安全轉換數值的內部函式 (處理逗號、空白、貨幣符號)
+    def safe_float(val):
+        try:
+            if isinstance(val, (int, float)): return float(val)
+            if val is None: return 0.0
+            s = str(val).replace(',', '').replace('$', '').replace(' ', '').strip()
+            if not s: return 0.0
+            return float(s)
+        except: return 0.0
+
     # 1. 讀取 User Sheet (庫存)
     user_ws = get_worksheet(client, f"User_{username}")
     h_data = {}
@@ -61,9 +78,12 @@ def load_data(client, username):
             if not code: continue
             try: lots = json.loads(r.get('Lots_Data', '[]'))
             except: lots = []
+            
+            # 使用 safe_float 處理可能的格式問題
             h_data[code] = {
                 'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
-                's': float(r.get('Shares', 0) or 0), 'c': float(r.get('AvgCost', 0) or 0),
+                's': safe_float(r.get('Shares', 0)), 
+                'c': safe_float(r.get('AvgCost', 0)),
                 'lots': lots
             }
 
@@ -82,7 +102,6 @@ def load_data(client, username):
         if len(raw_rows) > 1:
             for row in raw_rows[1:]:
                 row += [''] * (8 - len(row))
-                # 強制轉字串並去空白，避免格式問題
                 hist_data.append({
                     'Date': str(row[0]).strip(), 'Code': str(row[1]).strip(), 
                     'Name': str(row[2]).strip(), 'Qty': row[3], 'BuyCost': row[4], 
@@ -97,18 +116,22 @@ def load_data(client, username):
         if len(raw_rows) > 1:
             for row in raw_rows[1:]:
                 if len(row) >= 2:
-                    asset_history.append({
-                        'Date': str(row[0]).strip(),
-                        'NetAsset': row[1],
-                        'Principal': row[2] if len(row) > 2 else row[1]
-                    })
+                    net_val = str(row[1]).replace(',', '').strip()
+                    princ_val = str(row[2]).replace(',', '').strip() if len(row) > 2 else net_val
+                    
+                    if net_val and net_val.replace('.', '', 1).isdigit():
+                        asset_history.append({
+                            'Date': str(row[0]).strip(),
+                            'NetAsset': float(net_val),
+                            'Principal': float(princ_val) if princ_val else float(net_val)
+                        })
 
     return {
         'h': h_data,
-        'cash': float(acc_data.get('Cash', 0)),
-        'principal': float(acc_data.get('Principal', 0)),
+        'cash': safe_float(acc_data.get('Cash', 0)),
+        'principal': safe_float(acc_data.get('Principal', 0)),
         'last_update': acc_data.get('LastUpdate', ''),
-        'usdtwd': float(acc_data.get('USDTWD', 32.5)),
+        'usdtwd': safe_float(acc_data.get('USDTWD', 32.5)),
         'history': hist_data,
         'asset_history': asset_history
     }
@@ -422,7 +445,7 @@ k5.metric("💳 融資金額", f"${total_debt:,.0f}")
 
 st.subheader("📈 績效表現")
 
-# [Fix] 更強健的數值解析邏輯，處理 $ 符號與逗號
+# [Fix] 更強健的數值解析邏輯，處理 $ 符號與逗號，並同時檢查 Profit 與 profit 鍵值
 def safe_parse_profit(val):
     try:
         if isinstance(val, (int, float)): return float(val)
@@ -430,7 +453,8 @@ def safe_parse_profit(val):
         return float(s)
     except: return 0.0
 
-total_realized = sum(safe_parse_profit(r.get('Profit', 0)) for r in data.get('history', []))
+# 兼容兩種 Key (新版 Profit 與舊版 profit)
+total_realized = sum(safe_parse_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
 day_pct = (day_gain / (total_mkt - day_gain)) * 100 if (total_mkt - day_gain) > 0 else 0
 
 kp1, kp2, kp3, kp4 = st.columns(4)
