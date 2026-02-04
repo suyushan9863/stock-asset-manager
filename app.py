@@ -15,9 +15,9 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.8 (Pro UI + Data Fix)"
+APP_VERSION = "v4.9 (Critical Logic Fix)"
 
-# 自動清除舊快取與 Session State (解決資料結構不一致問題)
+# 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
     st.cache_data.clear()
     for key in list(st.session_state.keys()):
@@ -58,13 +58,13 @@ def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
     
-    # 安全數值轉換 (處理逗號、$符號、空白)
-    def safe_float(val):
+    # 數值清理工具
+    def clean_num(val):
         try:
             if isinstance(val, (int, float)): return float(val)
-            if val is None: return 0.0
+            if not val: return 0.0
+            # 移除常見干擾符號
             s = str(val).replace(',', '').replace('$', '').replace(' ', '').strip()
-            if not s: return 0.0
             return float(s)
         except: return 0.0
 
@@ -81,8 +81,8 @@ def load_data(client, username):
             
             h_data[code] = {
                 'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
-                's': safe_float(r.get('Shares', 0)), 
-                'c': safe_float(r.get('AvgCost', 0)),
+                's': clean_num(r.get('Shares', 0)), 
+                'c': clean_num(r.get('AvgCost', 0)),
                 'lots': lots
             }
 
@@ -100,11 +100,11 @@ def load_data(client, username):
         raw_rows = hist_ws.get_all_values()
         if len(raw_rows) > 1:
             for row in raw_rows[1:]:
-                row += [''] * (8 - len(row))
+                row += [''] * (8 - len(row)) # 補齊欄位
                 hist_data.append({
-                    'Date': str(row[0]).strip(), 'Code': str(row[1]).strip(), 
-                    'Name': str(row[2]).strip(), 'Qty': row[3], 'BuyCost': row[4], 
-                    'SellRev': row[5], 'Profit': row[6], 'ROI': row[7]
+                    'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 
+                    'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 
+                    'Profit': row[6], 'ROI': row[7] # 這裡先存原始字串，計算時再轉
                 })
 
     # 4. 讀取 Asset History (資產走勢)
@@ -115,22 +115,18 @@ def load_data(client, username):
         if len(raw_rows) > 1:
             for row in raw_rows[1:]:
                 if len(row) >= 2:
-                    net_val = str(row[1]).replace(',', '').strip()
-                    princ_val = str(row[2]).replace(',', '').strip() if len(row) > 2 else net_val
-                    # 簡單過濾非數字
-                    if net_val.replace('.', '', 1).replace('-', '').isdigit():
-                        asset_history.append({
-                            'Date': str(row[0]).strip(),
-                            'NetAsset': safe_float(net_val),
-                            'Principal': safe_float(princ_val)
-                        })
+                    asset_history.append({
+                        'Date': str(row[0]),
+                        'NetAsset': clean_num(row[1]),
+                        'Principal': clean_num(row[2]) if len(row) > 2 else clean_num(row[1])
+                    })
 
     return {
         'h': h_data,
-        'cash': safe_float(acc_data.get('Cash', 0)),
-        'principal': safe_float(acc_data.get('Principal', 0)),
+        'cash': clean_num(acc_data.get('Cash', 0)),
+        'principal': clean_num(acc_data.get('Principal', 0)),
         'last_update': acc_data.get('LastUpdate', ''),
-        'usdtwd': safe_float(acc_data.get('USDTWD', 32.5)),
+        'usdtwd': clean_num(acc_data.get('USDTWD', 32.5)),
         'history': hist_data,
         'asset_history': asset_history
     }
@@ -192,9 +188,8 @@ def get_usdtwd():
 
 def fetch_stock_price_robust(code, exchange=''):
     code = str(code).strip().upper()
-    is_tw = (exchange in ['tse', 'otc', 'TW', 'TWO']) or \
-            (code.endswith('.TW')) or (code.endswith('.TWO')) or \
-            (code.replace('.TW','').replace('.TWO','').isdigit())
+    # [Critical Fix] 強制判定台股，不依賴 Exchange 欄位
+    is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
     
     if is_tw:
         clean_code = code.replace('.TW', '').replace('.TWO', '')
@@ -328,10 +323,12 @@ with st.sidebar:
                     if b_code not in data['h']: data['h'][b_code] = {'n': info['n'], 'ex': ex_type, 's': 0, 'c': 0, 'lots': []}
                     h = data['h'][b_code]
                     h['lots'].append(new_lot)
+                    # 重算平均成本
                     tot_s = sum(l['s'] for l in h['lots'])
                     tot_c = sum(l['s'] * l['p'] for l in h['lots'])
                     h['s'] = tot_s
                     h['c'] = tot_c / tot_s if tot_s else 0
+                    
                     save_data(client, username, data)
                     log_transaction(client, username, "買入", b_code, b_price, b_qty)
                     st.success(f"買入 {b_code} 成功"); time.sleep(1); st.rerun()
@@ -366,6 +363,12 @@ with st.sidebar:
                 data['cash'] += (rev_twd - debt_payback)
                 h_curr['lots'] = new_lots
                 h_curr['s'] -= s_qty
+                
+                # 計算剩餘成本
+                if h_curr['s'] > 0:
+                    tc = sum(l['s'] * l['p'] for l in new_lots)
+                    h_curr['c'] = tc / h_curr['s']
+                
                 if h_curr['s'] <= 0: del data['h'][s_code]
                 
                 ws_hist = get_worksheet(client, f"Realized_{username}")
@@ -387,15 +390,15 @@ total_mkt = 0; total_cost = 0; total_debt = 0; day_gain = 0
 table_rows = []
 
 for code, info in data['h'].items():
-    if info['s'] <= 0: continue # 自動隱藏已售罄但未清除的紀錄
+    # [Critical Fix] 隱藏已售出但可能因浮點數誤差殘留的項目
+    if info['s'] < 0.01: continue 
     
     q = quotes.get(code, {'p': info['c'], 'chg': 0, 'pct': 0, 'n': info.get('n', code)})
     if q['n'] and q['n'] != code: info['n'] = q['n']
     
     s_code = str(code).upper()
-    is_tw = (info.get('ex') in ['tse', 'otc', 'TW', 'TWO']) or \
-            s_code.endswith('.TW') or s_code.endswith('.TWO') or \
-            s_code.replace('.TW','').replace('.TWO','').isdigit()
+    # [Critical Fix] 強制匯率判斷
+    is_tw = ('.TW' in s_code) or ('.TWO' in s_code) or (s_code.replace('.TW','').replace('.TWO','').isdigit())
     
     rate = 1.0 if is_tw else data.get('usdtwd', 32.5)
     
@@ -432,7 +435,7 @@ if st.button("🔄 更新即時股價", type="primary", use_container_width=True
         st.session_state.quotes = update_prices_batch(data['h'])
         data['last_update'] = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
         save_data(client, username, data)
-        record_asset_history(client, username, net_asset, data['principal']) # 記錄資產走勢
+        record_asset_history(client, username, net_asset, data['principal'])
         st.rerun()
 
 # --- 恢復完整面板 (資產 + 績效) ---
@@ -446,7 +449,7 @@ k5.metric("💳 融資金額", f"${total_debt:,.0f}")
 
 st.subheader("📈 績效表現")
 
-# [Fix] 更強健的數值解析邏輯，處理 $ 符號與逗號，並同時檢查 Profit 與 profit 鍵值
+# [Critical Fix] 嚴格解析歷史損益，支援字串與數值混合
 def safe_sum_profit(val):
     try:
         if isinstance(val, (int, float)): return float(val)
@@ -454,7 +457,6 @@ def safe_sum_profit(val):
         return float(s)
     except: return 0.0
 
-# 兼容兩種 Key (新版 Profit 與舊版 profit)
 total_realized = sum(safe_sum_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
 day_pct = (day_gain / (total_mkt - day_gain)) * 100 if (total_mkt - day_gain) > 0 else 0
 
@@ -505,9 +507,8 @@ with tab3:
     if hist_data:
         df_h = pd.DataFrame(hist_data)
         df_h['Date'] = pd.to_datetime(df_h['Date'], errors='coerce')
-        df_h = df_h.dropna(subset=['Date']) # 移除解析失敗的日期
+        df_h = df_h.dropna(subset=['Date'])
         
-        # 安全解析數值，處理可能的空白或異常字元
         def safe_float_col(x):
             try: 
                 s = str(x).replace(',', '').replace('$', '').replace(' ', '')
