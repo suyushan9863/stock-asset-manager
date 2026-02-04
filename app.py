@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v5.0 (Disaster Recovery)"
+APP_VERSION = "v5.1 (Rescue & Debug)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -178,33 +178,42 @@ def get_audit_logs(client, username, limit=50):
         if len(vals) > 1: return vals[1:][-limit:][::-1]
     return []
 
-# --- 災難恢復：從 Audit 重建庫存 ---
+# --- 災難恢復：從 Audit 重建庫存 (強化版) ---
 def reconstruct_inventory_from_audit(client, username):
     ws = get_worksheet(client, f"Audit_{username}")
-    if not ws: return {}
+    if not ws: return {}, "找不到 Audit 資料表"
     
     rows = ws.get_all_values()
-    if len(rows) < 2: return {}
-    
-    # 預期 header: Time, Action, Code, Amount, Shares, Memo
-    # 使用欄位索引以防 header 名稱變動: Action(1), Code(2), Amount(3), Shares(4)
+    if len(rows) < 2: return {}, "Audit 資料表為空 (只有標題或無資料)"
     
     recon_h = {}
+    stats = {'buy': 0, 'sell': 0, 'error': 0}
     
+    # 數值清理 (處理 $ 和 ,)
+    def clean_audit_num(s):
+        return float(str(s).replace(',', '').replace('$', '').replace(' ', '').strip())
+
     for r in rows[1:]:
-        if len(r) < 5: continue
+        if len(r) < 5: 
+            stats['error'] += 1
+            continue
+            
         action = str(r[1]).strip()
         raw_code = str(r[2]).strip()
-        if not raw_code: continue
+        if not raw_code: 
+            stats['error'] += 1
+            continue
         
-        # 解析代碼 (可能含名稱 e.g. 2330_TSMC)
+        # 解析代碼
         code = raw_code.split('_')[0].strip().upper()
         name_hint = raw_code.split('_')[1] if '_' in raw_code else code
         
         try:
-            qty = float(str(r[4]).replace(',', '').strip())
-            price = float(str(r[3]).replace(',', '').strip())
-        except: continue
+            qty = clean_audit_num(r[4])
+            price = clean_audit_num(r[3])
+        except: 
+            stats['error'] += 1
+            continue
         
         if code not in recon_h:
             is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
@@ -217,9 +226,9 @@ def reconstruct_inventory_from_audit(client, username):
         curr = recon_h[code]
         
         if action == '買入':
+            stats['buy'] += 1
             new_lot = {'d': r[0], 'p': price, 's': qty, 'debt': 0}
             curr['lots'].append(new_lot)
-            # 重算成本
             prev_s = curr['s']
             prev_cost_total = prev_s * curr['c']
             new_s = prev_s + qty
@@ -228,8 +237,8 @@ def reconstruct_inventory_from_audit(client, username):
             curr['c'] = new_cost_total / new_s if new_s > 0 else 0
             
         elif action == '賣出':
+            stats['sell'] += 1
             curr['s'] = max(0, curr['s'] - qty)
-            # 簡單移除 lots
             remain = qty
             new_lots = []
             for lot in curr['lots']:
@@ -244,7 +253,8 @@ def reconstruct_inventory_from_audit(client, username):
             if curr['s'] <= 0.01:
                 del recon_h[code]
                 
-    return recon_h
+    msg = f"掃描完成: 發現 {stats['buy']} 筆買入, {stats['sell']} 筆賣出, 忽略 {stats['error']} 筆異常格式。"
+    return recon_h, msg
 
 # --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
@@ -390,12 +400,10 @@ with st.sidebar:
                     if b_code not in data['h']: data['h'][b_code] = {'n': info['n'], 'ex': ex_type, 's': 0, 'c': 0, 'lots': []}
                     h = data['h'][b_code]
                     h['lots'].append(new_lot)
-                    # 重算平均成本
                     tot_s = sum(l['s'] for l in h['lots'])
                     tot_c = sum(l['s'] * l['p'] for l in h['lots'])
                     h['s'] = tot_s
                     h['c'] = tot_c / tot_s if tot_s else 0
-                    
                     save_data(client, username, data)
                     log_transaction(client, username, "買入", b_code, b_price, b_qty)
                     st.success(f"買入 {b_code} 成功"); time.sleep(1); st.rerun()
@@ -431,7 +439,6 @@ with st.sidebar:
                 h_curr['lots'] = new_lots
                 h_curr['s'] -= s_qty
                 
-                # 計算剩餘成本
                 if h_curr['s'] > 0:
                     tc = sum(l['s'] * l['p'] for l in new_lots)
                     h_curr['c'] = tc / h_curr['s']
@@ -450,19 +457,27 @@ with st.sidebar:
         show_audit_log_modal(logs)
     
     st.markdown("---")
-    with st.expander("⛑️ 災難恢復 / 資料救援"):
-        st.warning("如果您的庫存因錯誤歸零，請使用此功能。")
-        if st.button("從交易紀錄重建庫存", type="primary"):
-            with st.spinner("正在掃描歷史交易紀錄並重建..."):
-                restored_h = reconstruct_inventory_from_audit(client, username)
+    with st.expander("⛑️ 災難恢復 / 資料救援", expanded=True):
+        st.warning("如果您的庫存消失，請先檢查下方原始檔案，再執行重建。")
+        
+        if st.button("👁️ 檢視原始交易檔案"):
+            raw_audit = get_audit_logs(client, username, 1000)
+            if raw_audit:
+                st.dataframe(pd.DataFrame(raw_audit, columns=['Time', 'Action', 'Code', 'Amount', 'Shares', 'Memo']), use_container_width=True)
+            else:
+                st.error("警告：讀取不到原始交易檔案，這可能是檔案被刪除或權限問題。")
+
+        if st.button("🛠️ 強制執行庫存重建", type="primary"):
+            with st.spinner("正在強制解析並重建庫存..."):
+                restored_h, msg = reconstruct_inventory_from_audit(client, username)
                 if restored_h:
                     data['h'] = restored_h
                     save_data(client, username, data)
-                    st.success(f"成功恢復 {len(restored_h)} 檔股票庫存！請重新整理頁面。")
-                    time.sleep(2)
+                    st.success(f"{msg} 請重新整理頁面。")
+                    time.sleep(3)
                     st.rerun()
                 else:
-                    st.error("找不到有效的交易紀錄可供重建。")
+                    st.error(f"重建失敗: {msg}")
 
 st.title(f"📈 資產管家")
 
@@ -472,14 +487,12 @@ total_mkt = 0; total_cost = 0; total_debt = 0; day_gain = 0
 table_rows = []
 
 for code, info in data['h'].items():
-    # [Critical Fix] 隱藏已售出但可能因浮點數誤差殘留的項目
     if info['s'] < 0.01: continue 
     
     q = quotes.get(code, {'p': info['c'], 'chg': 0, 'pct': 0, 'n': info.get('n', code)})
     if q['n'] and q['n'] != code: info['n'] = q['n']
     
     s_code = str(code).upper()
-    # [Critical Fix] 強制匯率判斷
     is_tw = ('.TW' in s_code) or ('.TWO' in s_code) or (s_code.replace('.TW','').replace('.TWO','').isdigit())
     
     rate = 1.0 if is_tw else data.get('usdtwd', 32.5)
@@ -531,7 +544,6 @@ k5.metric("💳 融資金額", f"${total_debt:,.0f}")
 
 st.subheader("📈 績效表現")
 
-# [Critical Fix] 嚴格解析歷史損益，支援字串與數值混合
 def safe_sum_profit(val):
     try:
         if isinstance(val, (int, float)): return float(val)
@@ -569,7 +581,6 @@ with tab1:
             use_container_width=True, hide_index=True, height=500
         )
     else:
-        # 當偵測到無庫存時，主動提示修復
         st.info("⚠️ 尚無庫存顯示。若您確定持有股票但未顯示，請使用左側選單下方的「⛑️ 災難恢復」功能。")
 
 with tab2:
