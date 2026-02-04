@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v3.4 (Hybrid Engine & PnL%)"
+APP_VERSION = "v3.5 (Hotfix 4 - State Repair)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -327,7 +327,6 @@ def get_usdtwd():
 def fetch_prices_hybrid(tw_codes):
     """
     雙引擎查價：先用證交所 API，失敗則自動切換到 Yahoo Finance。
-    解決 4958 或其他台股抓不到的問題。
     """
     if not tw_codes: return {}
     results = {}
@@ -368,7 +367,6 @@ def fetch_prices_hybrid(tw_codes):
 
     # 2. 檢查哪些失敗 (Missing or Zero Price)
     missing_codes = []
-    # Original list format is like "tse_2330.tw", we need "2330.TW" for yfinance
     for q_code in tw_codes:
         # Extract pure code: tse_2330.tw -> 2330
         pure_code = q_code.split('_')[1].split('.')[0]
@@ -378,26 +376,16 @@ def fetch_prices_hybrid(tw_codes):
     # 3. 啟動 Yahoo Finance Backup (Secondary)
     if missing_codes:
         try:
-            # Batch download is faster
             yf_data = yf.download(missing_codes, period="1d", progress=False)
-            
-            # yf.download structure depends on number of tickers
-            # If multi-index, price is in ['Close', 'Ticker']
             for m_code in missing_codes:
                 pure = m_code.replace('.TW', '')
                 try:
-                    # Get Last Price
                     if len(missing_codes) == 1:
-                        # Series
                         last_p = float(yf_data['Close'].iloc[-1])
                     else:
-                        # DataFrame
                         last_p = float(yf_data['Close'][m_code].iloc[-1])
                     
-                    # Approximated change (since realtime change is hard in batch)
-                    # We can fetch 'Open' or 'Prev Close' if needed, here we assume 0 chg if not detailed
-                    # Or fetch Ticker info for one by one if batch fails.
-                    # Simple fallback:
+                    # Fallback object
                     results[pure] = {'p': last_p, 'chg': 0, 'chg_pct': 0, 'n': pure, 'realtime': False}
                     results[f"{pure}.TW"] = results[pure]
                     results[f"{pure}.TWO"] = results[pure]
@@ -550,8 +538,7 @@ def update_dashboard_data(use_realtime=True):
         roi_basis = current_principal if current_principal > 0 else 1
         total_roi_pct = (total_profit_sum / roi_basis) * 100
 
-        # [v3.4 New] Calculate Day PnL Percentage (Based on Opening Market Value)
-        # Prev MV = Current MV - Day PnL
+        # [v3.4 New] Calculate Day PnL Percentage
         prev_mkt_val = total_mkt_val - total_day_profit
         day_profit_pct = (total_day_profit / prev_mkt_val * 100) if prev_mkt_val > 0 else 0.0
 
@@ -561,7 +548,7 @@ def update_dashboard_data(use_realtime=True):
             'total_mkt_val': total_mkt_val,
             'current_principal': current_principal,
             'total_day_profit': total_day_profit,
-            'day_profit_pct': day_profit_pct, # Added
+            'day_profit_pct': day_profit_pct, 
             'unrealized_profit': unrealized_profit,
             'total_realized_profit': total_realized_profit,
             'total_profit_sum': total_profit_sum,
@@ -657,6 +644,9 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
+    **v3.5 Hotfix 4**
+    1.  **State Repair**: 修正因舊版本快取導致的 KeyError，確保新功能平滑過渡。
+    
     **v3.4 Hybrid Engine & PnL%**
     1.  **台股雙引擎查價**: 優先使用 TWSE API，若失敗 (如 4958) 自動切換至 Yahoo Finance 補抓，確保價格不漏接。
     2.  **今日損益百分比**: 新增顯示今日資產變動的百分比 (Today PnL %)。
@@ -949,8 +939,8 @@ if st.session_state.dashboard_data:
     
     st.subheader("📈 績效表現")
     kp1, kp2, kp3, kp4 = st.columns(4)
-    # [v3.4] Added Percentage Display
-    kp1.metric("📅 今日損益", f"${int(d['total_day_profit']):+,} ({d['day_profit_pct']:+.2f}%)")
+    # [v3.5 Fix] Use .get() to prevent KeyError if cached data doesn't have the new key
+    kp1.metric("📅 今日損益", f"${int(d['total_day_profit']):+,} ({d.get('day_profit_pct', 0.0):+.2f}%)")
     kp2.metric("💰 總損益 (已+未)", f"${int(d['total_profit_sum']):+,}")
     kp3.metric("🏆 總報酬率 (ROI)", f"{d['total_roi_pct']:+.2f}%")
     kp4.metric("📥 其中已實現", f"${int(d['total_realized_profit']):+,}")
