@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v6.0 (Stable Release)"
+APP_VERSION = "v6.1 (Yahoo First & Price Memory)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -52,11 +52,10 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
             if default_header: ws.append_row(default_header)
             return ws
     except Exception as e:
-        # 這裡保留錯誤提示，若是連線問題方便排查
         st.sidebar.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
         return None
 
-# --- 資料讀寫核心 (保留自動校正邏輯) ---
+# --- 資料讀寫核心 (含價格記憶) ---
 def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
@@ -65,7 +64,6 @@ def load_data(client, username):
         try:
             if isinstance(val, (int, float)): return float(val)
             if not val: return 0.0
-            # 強力移除所有非數值字元
             s = str(val).replace(',', '').replace('$', '').replace(' ', '').replace('%', '').strip()
             return float(s)
         except: return 0.0
@@ -80,29 +78,29 @@ def load_data(client, username):
                 code = str(r.get('Code', '')).strip()
                 if not code: continue
                 
-                # 解析 Lots Data
-                try: 
-                    lots = json.loads(r.get('Lots_Data', '[]'))
-                except: 
-                    lots = []
+                try: lots = json.loads(r.get('Lots_Data', '[]'))
+                except: lots = []
                 
-                # [核心邏輯] 始終以 Lots 明細重新計算股數與成本，確保資料正確性
-                # 這能防止 Google Sheet 欄位格式跑掉的問題
+                # 自動修復邏輯：優先從 Lots 計算
                 if lots:
                     calc_shares = sum(float(l.get('s', 0)) for l in lots)
                     calc_cost_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
                     calc_avg_cost = (calc_cost_val / calc_shares) if calc_shares > 0 else 0.0
-                    
                     final_s = calc_shares
                     final_c = calc_avg_cost
                 else:
                     final_s = clean_num(r.get('Shares', 0))
                     final_c = clean_num(r.get('AvgCost', 0))
                 
+                # [New Feature] 讀取上次存檔的價格 (LastPrice)
+                # 如果 Excel 沒這欄位，預設為 0
+                saved_last_p = clean_num(r.get('LastPrice', 0))
+                
                 h_data[code] = {
                     'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
                     's': final_s, 
                     'c': final_c,
+                    'last_p': saved_last_p, # 載入記憶價格
                     'lots': lots
                 }
         except Exception as e:
@@ -117,7 +115,7 @@ def load_data(client, username):
                 if len(row) >= 2: acc_data[row[0]] = row[1]
         except: pass
 
-    # 3. 讀取 Realized History (已實現損益)
+    # 3. 讀取 Realized History
     hist_ws = get_worksheet(client, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
     hist_data = []
     if hist_ws:
@@ -133,7 +131,7 @@ def load_data(client, username):
                     })
         except: pass
 
-    # 4. 讀取 Asset History (資產走勢)
+    # 4. 讀取 Asset History
     asset_ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
     asset_history = []
     if asset_ws:
@@ -162,22 +160,26 @@ def load_data(client, username):
 def save_data(client, username, data):
     if not client: return
     
-    # 存資金
     acc_ws = get_worksheet(client, f"Account_{username}")
     if acc_ws:
         acc_ws.clear()
         acc_ws.update('A1', [['Key', 'Value'], ['Cash', data['cash']], ['Principal', data['principal']], ['LastUpdate', data.get('last_update', '')], ['USDTWD', data.get('usdtwd', 32.5)]])
 
-    # 存庫存 - 確保寫入純數字，修正 Google Sheet 格式
+    # 存庫存 - [New] 新增 LastPrice 欄位寫入
     user_ws = get_worksheet(client, f"User_{username}")
     if user_ws:
-        headers = ['Code', 'Name', 'Exchange', 'Shares', 'AvgCost', 'Lots_Data']
+        headers = ['Code', 'Name', 'Exchange', 'Shares', 'AvgCost', 'Lots_Data', 'LastPrice']
         rows = [headers]
         for code, info in data.get('h', {}).items():
+            # 取得最新價格，若無則用成本 (但這應該是極少數)
+            current_p = info.get('last_p', 0)
+            if current_p == 0: current_p = info.get('c', 0)
+            
             rows.append([
                 code, info.get('n', ''), info.get('ex', ''),
-                float(info.get('s', 0)), float(info.get('c', 0)), # 強制轉 float 寫入
-                json.dumps(info.get('lots', []), ensure_ascii=False)
+                float(info.get('s', 0)), float(info.get('c', 0)),
+                json.dumps(info.get('lots', []), ensure_ascii=False),
+                float(current_p) # 寫入 LastPrice
             ])
         user_ws.clear()
         user_ws.update('A1', rows)
@@ -206,11 +208,12 @@ def get_audit_logs(client, username, limit=50):
         if len(vals) > 1: return vals[1:][-limit:][::-1]
     return []
 
-# --- 股價抓取核心 ---
+# --- 股價抓取核心 (Yahoo 優先策略) ---
 @st.cache_data(ttl=300)
 def get_usdtwd():
     try:
         t = yf.Ticker("USDTWD=X")
+        # 使用 history 防止 fast_info 失敗
         return t.history(period="1d")['Close'].iloc[-1]
     except: return 32.5
 
@@ -218,6 +221,34 @@ def fetch_stock_price_robust(code, exchange=''):
     code = str(code).strip().upper()
     is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
     
+    # 建立 Yahoo Finance 代碼
+    yf_code = code
+    if is_tw and '.TW' not in yf_code and '.TWO' not in yf_code: yf_code = f"{code}.TW"
+    
+    price = 0.0
+    prev_close = 0.0
+    fetched_name = code
+
+    # [Strategy Shift] 優先使用 Yahoo Finance (對 Cloud IP 更穩定)
+    try:
+        t = yf.Ticker(yf_code)
+        # 嘗試 history (最穩)
+        hist = t.history(period="5d")
+        if not hist.empty:
+            price = hist['Close'].iloc[-1]
+            prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else price
+        
+        # 嘗試獲取名稱
+        try: fetched_name = t.info.get('shortName') or t.info.get('longName') or code
+        except: pass
+        
+        if price > 0:
+            chg = price - prev_close
+            pct = (chg / prev_close * 100) if prev_close > 0 else 0
+            return {'p': price, 'chg': chg, 'pct': pct, 'n': fetched_name, 'src': 'Yahoo'}
+    except Exception: pass
+
+    # [Backup] TWSE API (Yahoo 失敗才用)
     if is_tw:
         clean_code = code.replace('.TW', '').replace('.TWO', '')
         queries = [f"tse_{clean_code}.tw", f"otc_{clean_code}.tw"]
@@ -225,7 +256,7 @@ def fetch_stock_price_robust(code, exchange=''):
             ts = int(time.time() * 1000)
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={'|'.join(queries)}&json=1&delay=0&_={ts}"
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-            r = requests.get(url, headers=headers, verify=False, timeout=5)
+            r = requests.get(url, headers=headers, verify=False, timeout=3) # 短超時
             data = r.json()
             if 'msgArray' in data:
                 for item in data['msgArray']:
@@ -239,31 +270,10 @@ def fetch_stock_price_robust(code, exchange=''):
                         y_close = float(item.get('y', 0))
                         chg = price - y_close if price > 0 else 0
                         pct = (chg / y_close * 100) if y_close > 0 else 0
-                        return {'p': price, 'chg': chg, 'pct': pct, 'n': item.get('n', code)}
+                        return {'p': price, 'chg': chg, 'pct': pct, 'n': item.get('n', code), 'src': 'TWSE'}
         except Exception: pass
 
-    try:
-        yf_code = code
-        if is_tw and '.TW' not in yf_code and '.TWO' not in yf_code: yf_code = f"{code}.TW"
-        t = yf.Ticker(yf_code)
-        price = 0.0; prev_close = 0.0
-        if hasattr(t, 'fast_info') and 'last_price' in t.fast_info:
-            price = t.fast_info['last_price']
-            prev_close = t.fast_info.get('previous_close', 0)
-        if price == 0 or price is None:
-            hist = t.history(period="5d")
-            if not hist.empty:
-                price = hist['Close'].iloc[-1]
-                prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else price
-        if price and price > 0:
-            chg = price - prev_close
-            pct = (chg / prev_close * 100) if prev_close > 0 else 0
-            name = code
-            try: name = t.info.get('shortName') or t.info.get('longName') or code
-            except: pass
-            return {'p': price, 'chg': chg, 'pct': pct, 'n': name}
-    except Exception: pass
-    return {'p': 0, 'chg': 0, 'pct': 0, 'n': code}
+    return {'p': 0, 'chg': 0, 'pct': 0, 'n': code, 'src': 'Fail'}
 
 def update_prices_batch(portfolio):
     results = {}
@@ -297,7 +307,6 @@ if not st.session_state.current_user:
             if st.form_submit_button("Login", use_container_width=True):
                 users = st.secrets.get("passwords", {})
                 if u in users and str(users[u]) == str(p):
-                    # 強制去除空白
                     st.session_state.current_user = u.strip()
                     st.rerun()
                 else: st.error("Failed")
@@ -419,17 +428,28 @@ table_rows = []
 for code, info in data['h'].items():
     if info['s'] < 0.01: continue 
     
-    q = quotes.get(code, {'p': info['c'], 'chg': 0, 'pct': 0, 'n': info.get('n', code)})
-    if q['n'] and q['n'] != code: info['n'] = q['n']
+    # [Core Fix] 優先使用即時報價 -> 其次使用記憶價格(LastPrice) -> 最後才用成本
+    q = quotes.get(code)
+    if q and q['p'] > 0:
+        curr_p = q['p']
+        # 更新記憶 (Session級別)
+        info['last_p'] = curr_p 
+    else:
+        # Fallback 1: 記憶價格 (從Sheet載入)
+        curr_p = info.get('last_p', 0)
+        # Fallback 2: 成本價 (如果完全是新的)
+        if curr_p == 0: curr_p = info.get('c', 0)
+        q = {'chg': 0, 'pct': 0, 'n': info.get('n', code)} # 假報價物件
+
+    # 更新名稱
+    if q.get('n') and q['n'] != code: info['n'] = q['n']
     
     s_code = str(code).upper()
     is_tw = ('.TW' in s_code) or ('.TWO' in s_code) or (s_code.replace('.TW','').replace('.TWO','').isdigit())
-    
     rate = 1.0 if is_tw else data.get('usdtwd', 32.5)
     
     qty = info['s']
     cost = info['c']
-    curr_p = q['p'] if q['p'] > 0 else cost
     
     mkt_val = qty * curr_p * rate
     cost_val = qty * cost * rate
@@ -455,11 +475,11 @@ roi_pct = ((net_asset - data['principal']) / data['principal'] * 100) if data['p
 
 # 更新股價與紀錄
 if st.button("🔄 更新即時股價", type="primary", use_container_width=True):
-    with st.spinner("更新中..."):
+    with st.spinner("更新中... (優先使用 Yahoo)"):
         data['usdtwd'] = get_usdtwd()
         st.session_state.quotes = update_prices_batch(data['h'])
         data['last_update'] = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
-        save_data(client, username, data)
+        save_data(client, username, data) # 這步會把抓到的股價存入 LastPrice
         record_asset_history(client, username, net_asset, data['principal'])
         st.rerun()
 
@@ -511,7 +531,7 @@ with tab1:
             use_container_width=True, hide_index=True, height=500
         )
     else:
-        st.info("尚無庫存，請從左側新增。")
+        st.info("⚠️ 尚無庫存顯示。")
 
 with tab2:
     if table_rows:
