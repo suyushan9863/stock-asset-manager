@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.9 (Critical Logic Fix)"
+APP_VERSION = "v5.0 (Disaster Recovery)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -104,7 +104,7 @@ def load_data(client, username):
                 hist_data.append({
                     'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 
                     'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 
-                    'Profit': row[6], 'ROI': row[7] # 這裡先存原始字串，計算時再轉
+                    'Profit': row[6], 'ROI': row[7]
                 })
 
     # 4. 讀取 Asset History (資產走勢)
@@ -178,6 +178,74 @@ def get_audit_logs(client, username, limit=50):
         if len(vals) > 1: return vals[1:][-limit:][::-1]
     return []
 
+# --- 災難恢復：從 Audit 重建庫存 ---
+def reconstruct_inventory_from_audit(client, username):
+    ws = get_worksheet(client, f"Audit_{username}")
+    if not ws: return {}
+    
+    rows = ws.get_all_values()
+    if len(rows) < 2: return {}
+    
+    # 預期 header: Time, Action, Code, Amount, Shares, Memo
+    # 使用欄位索引以防 header 名稱變動: Action(1), Code(2), Amount(3), Shares(4)
+    
+    recon_h = {}
+    
+    for r in rows[1:]:
+        if len(r) < 5: continue
+        action = str(r[1]).strip()
+        raw_code = str(r[2]).strip()
+        if not raw_code: continue
+        
+        # 解析代碼 (可能含名稱 e.g. 2330_TSMC)
+        code = raw_code.split('_')[0].strip().upper()
+        name_hint = raw_code.split('_')[1] if '_' in raw_code else code
+        
+        try:
+            qty = float(str(r[4]).replace(',', '').strip())
+            price = float(str(r[3]).replace(',', '').strip())
+        except: continue
+        
+        if code not in recon_h:
+            is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
+            recon_h[code] = {
+                'n': name_hint, 
+                'ex': 'TW' if is_tw else 'US', 
+                's': 0.0, 'c': 0.0, 'lots': []
+            }
+            
+        curr = recon_h[code]
+        
+        if action == '買入':
+            new_lot = {'d': r[0], 'p': price, 's': qty, 'debt': 0}
+            curr['lots'].append(new_lot)
+            # 重算成本
+            prev_s = curr['s']
+            prev_cost_total = prev_s * curr['c']
+            new_s = prev_s + qty
+            new_cost_total = prev_cost_total + (qty * price)
+            curr['s'] = new_s
+            curr['c'] = new_cost_total / new_s if new_s > 0 else 0
+            
+        elif action == '賣出':
+            curr['s'] = max(0, curr['s'] - qty)
+            # 簡單移除 lots
+            remain = qty
+            new_lots = []
+            for lot in curr['lots']:
+                if remain > 0:
+                    take = min(lot['s'], remain)
+                    lot['s'] -= take
+                    remain -= take
+                    if lot['s'] > 0: new_lots.append(lot)
+                else:
+                    new_lots.append(lot)
+            curr['lots'] = new_lots
+            if curr['s'] <= 0.01:
+                del recon_h[code]
+                
+    return recon_h
+
 # --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
 def get_usdtwd():
@@ -188,7 +256,6 @@ def get_usdtwd():
 
 def fetch_stock_price_robust(code, exchange=''):
     code = str(code).strip().upper()
-    # [Critical Fix] 強制判定台股，不依賴 Exchange 欄位
     is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
     
     if is_tw:
@@ -381,6 +448,21 @@ with st.sidebar:
     if st.button("📋 異動歷程"):
         logs = get_audit_logs(client, username)
         show_audit_log_modal(logs)
+    
+    st.markdown("---")
+    with st.expander("⛑️ 災難恢復 / 資料救援"):
+        st.warning("如果您的庫存因錯誤歸零，請使用此功能。")
+        if st.button("從交易紀錄重建庫存", type="primary"):
+            with st.spinner("正在掃描歷史交易紀錄並重建..."):
+                restored_h = reconstruct_inventory_from_audit(client, username)
+                if restored_h:
+                    data['h'] = restored_h
+                    save_data(client, username, data)
+                    st.success(f"成功恢復 {len(restored_h)} 檔股票庫存！請重新整理頁面。")
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error("找不到有效的交易紀錄可供重建。")
 
 st.title(f"📈 資產管家")
 
@@ -487,7 +569,8 @@ with tab1:
             use_container_width=True, hide_index=True, height=500
         )
     else:
-        st.info("尚無庫存，請從左側新增。")
+        # 當偵測到無庫存時，主動提示修復
+        st.info("⚠️ 尚無庫存顯示。若您確定持有股票但未顯示，請使用左側選單下方的「⛑️ 災難恢復」功能。")
 
 with tab2:
     if table_rows:
