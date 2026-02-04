@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v3.5 (Hotfix 6 - Yahoo Change Fix)"
+APP_VERSION = "v3.6 (4958 & KY-Stock Fix)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -162,7 +162,7 @@ def sync_us_prices_via_sheet(client, codes_dict):
                 except:
                     price = 0; chg = 0; pct = 0; name = r_code
                 if r_code in codes_dict:
-                      results[r_code] = {'p': price, 'chg': chg, 'chg_pct': pct, 'n': name}
+                       results[r_code] = {'p': price, 'chg': chg, 'chg_pct': pct, 'n': name}
     except: pass
     return results
 
@@ -354,15 +354,15 @@ def show_audit_log_modal(logs):
     else:
         st.info("無近期異動紀錄")
 
-# --- [v3.5 Hotfix 6] Robust Hybrid Fetcher (Fix Yahoo Change) ---
+# --- [v3.6 Fix] Robust Hybrid Fetcher (Fix 4958 & KY Stocks) ---
 def fetch_prices_hybrid(tw_codes):
     """
-    雙引擎查價：證交所 API + Yahoo Finance Fallback (含漲跌幅計算)
+    雙引擎查價：證交所 API + Yahoo Finance Fallback (強化單股查詢)
     """
     if not tw_codes: return {}
     results = {}
     
-    # 1. 建立查詢字串 (第一次嘗試)
+    # 1. 建立查詢字串 (TSE/OTC 混合)
     query_str = "|".join(tw_codes)
     
     def call_twse_api(q_str):
@@ -384,11 +384,16 @@ def fetch_prices_hybrid(tw_codes):
             c = item.get('c', '')
             n = item.get('n', '')
             price_str = item.get('z', '-')
+            
+            # Fallback for KY stocks or low liquidity
             if price_str == '-':
                 bid = item.get('b', '').split('_')[0]
                 ask = item.get('a', '').split('_')[0]
                 if bid and bid != '-' and bid != '0.00': price_str = bid
                 elif ask and ask != '-' and ask != '0.00': price_str = ask
+                else: 
+                     # Try previous close or open as last resort
+                     price_str = item.get('o', item.get('y', '0.0'))
             
             try:
                 price = float(price_str) if price_str and price_str != '-' else 0.0
@@ -407,9 +412,8 @@ def fetch_prices_hybrid(tw_codes):
     if 'msgArray' in data:
         results.update(parse_msg_array(data['msgArray']))
 
-    # 2. 自動修正機制 (Auto-Correction)
+    # 2. 自動修正機制 (Auto-Correction for TSE/OTC mismatch)
     retry_codes = []
-    
     for q_code in tw_codes:
         pure_code = q_code.split('_')[1].split('.')[0]
         if pure_code not in results or results[pure_code]['p'] == 0:
@@ -426,7 +430,7 @@ def fetch_prices_hybrid(tw_codes):
         if 'msgArray' in data_retry:
             results.update(parse_msg_array(data_retry['msgArray']))
 
-    # 3. 檢查最終遺漏 (Missing) 並啟動 Yahoo Finance Backup
+    # 3. 檢查最終遺漏並啟動 Yahoo Finance Backup
     missing_for_yahoo = []
     for q_code in tw_codes:
         pure_code = q_code.split('_')[1].split('.')[0]
@@ -434,18 +438,20 @@ def fetch_prices_hybrid(tw_codes):
             missing_for_yahoo.append(pure_code + ".TW") 
 
     if missing_for_yahoo:
+        # 3.1 嘗試批次下載
         try:
-            # 改為抓取 5 天資料，以便計算漲跌
-            yf_data = yf.download(missing_for_yahoo, period="5d", progress=False)
-            is_single = len(missing_for_yahoo) == 1
+            yf_data = yf.download(missing_for_yahoo, period="5d", progress=False, group_by='ticker', auto_adjust=False)
             
             for m_code in missing_for_yahoo:
                 pure = m_code.replace('.TW', '')
                 try:
-                    if is_single:
+                    # Handle Data Structure (Single vs Multi)
+                    if len(missing_for_yahoo) == 1:
                         series = yf_data['Close']
                     else:
-                        series = yf_data['Close'][m_code]
+                        if m_code in yf_data.columns.levels[0]:
+                             series = yf_data[m_code]['Close']
+                        else: continue
 
                     series = series.dropna()
                     if len(series) >= 2:
@@ -453,19 +459,33 @@ def fetch_prices_hybrid(tw_codes):
                         prev_p = float(series.iloc[-2])
                         chg = last_p - prev_p
                         pct = (chg / prev_p) * 100
-                    elif len(series) == 1:
-                        last_p = float(series.iloc[-1])
-                        chg = 0.0; pct = 0.0
-                    else:
-                        continue
+                        
+                        if last_p > 0:
+                            res_obj = {'p': last_p, 'chg': chg, 'chg_pct': pct, 'n': pure, 'realtime': False}
+                            results[pure] = res_obj
+                            results[f"{pure}.TW"] = res_obj
+                            results[f"{pure}.TWO"] = res_obj
+                except: pass
+        except: pass
 
-                    if last_p > 0:
+        # 3.2 Last Resort: 單獨查詢 (針對 4958 這類死硬派)
+        for m_code in missing_for_yahoo:
+            pure = m_code.replace('.TW', '')
+            if pure not in results:
+                try:
+                    t = yf.Ticker(m_code)
+                    hist = t.history(period="5d")
+                    if not hist.empty:
+                        last_p = float(hist['Close'].iloc[-1])
+                        prev_p = float(hist['Close'].iloc[-2]) if len(hist) > 1 else last_p
+                        chg = last_p - prev_p
+                        pct = (chg / prev_p * 100) if prev_p > 0 else 0
+                        
                         res_obj = {'p': last_p, 'chg': chg, 'chg_pct': pct, 'n': pure, 'realtime': False}
                         results[pure] = res_obj
                         results[f"{pure}.TW"] = res_obj
                         results[f"{pure}.TWO"] = res_obj
                 except: pass
-        except: pass
 
     return results
 
@@ -518,7 +538,7 @@ def update_dashboard_data(use_realtime=True):
     
     try:
         if use_realtime:
-            with st.spinner('正在同步市場數據 (台股雙引擎+自動修正+美股)...'):
+            with st.spinner('正在同步市場數據 (v3.6 4958 Fix)...'):
                 usdtwd = get_usdtwd()
                 h = data.get('h', {})
                 batch_prices = get_batch_market_data(h, usdtwd)
@@ -718,11 +738,11 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
-    **v3.5 Hotfix 6 (Yahoo Change Fix)**
-    1.  **Yahoo Finance 漲跌計算**: 修正備援機制只抓到現價但沒抓到漲跌幅的問題。現在會抓取 5 天歷史資料來正確計算今日漲跌。
-    
-    **v3.5 Hotfix 5 (4958 Fix)**
-    1.  **自動修正 TSE/OTC**: 當遇到抓取失敗的台股，系統會自動交換交易所前綴重試。
+    **v3.6 (4958 & KY-Stock Fix)**
+    1.  **修復 4958 (臻鼎-KY) 無法抓取問題**: 
+        * 強化 TWSE API 解析，當遇上 KY 股無成交價時，自動嘗試讀取買賣價或開盤價。
+        * 增加 Yahoo Finance 「單股重試機制」：若批次下載失敗，系統會針對遺漏的股票單獨發送請求，確保抓到數據。
+    2.  **Yahoo 資料結構相容性**: 修復了 `yfinance` 在不同版本回傳格式不一致導致的漏抓問題。
     """)
 
 # --- 主程式 ---
@@ -1011,7 +1031,6 @@ if st.session_state.dashboard_data:
     
     st.subheader("📈 績效表現")
     kp1, kp2, kp3, kp4 = st.columns(4)
-    # [v3.5 Fix] Use .get() to prevent KeyError if cached data doesn't have the new key
     kp1.metric("📅 今日損益", f"${int(d['total_day_profit']):+,} ({d.get('day_profit_pct', 0.0):+.2f}%)")
     kp2.metric("💰 總損益 (已+未)", f"${int(d['total_profit_sum']):+,}")
     kp3.metric("🏆 總報酬率 (ROI)", f"{d['total_roi_pct']:+.2f}%")
