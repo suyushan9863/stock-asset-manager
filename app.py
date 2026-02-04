@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.2 (Pro UI Restored)"
+APP_VERSION = "v4.3 (Full Dashboard Restored)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -391,11 +391,24 @@ if st.button("🔄 更新即時股價", type="primary", use_container_width=True
         record_asset_history(client, username, net_asset, data['principal']) # 記錄資產走勢
         st.rerun()
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("淨資產", f"${net_asset:,.0f}", delta=f"{day_gain:,.0f} (今日)")
-m2.metric("證券市值", f"${total_mkt:,.0f}")
-m3.metric("總報酬率", f"{roi_pct:+.2f}%", f"${(net_asset - data['principal']):,.0f}")
-m4.metric("現金", f"${data['cash']:,.0f}")
+# --- 恢復完整面板 (資產 + 績效) ---
+st.subheader("🏦 資產概況")
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("💰 淨資產", f"${net_asset:,.0f}")
+k2.metric("💵 現金餘額", f"${data['cash']:,.0f}")
+k3.metric("📊 證券市值", f"${total_mkt:,.0f}")
+k4.metric("📉 投入本金", f"${data['principal']:,.0f}")
+k5.metric("💳 融資金額", f"${total_debt:,.0f}")
+
+st.subheader("📈 績效表現")
+total_realized = sum(float(str(r.get('Profit', 0)).replace(',','')) for r in data.get('history', []))
+day_pct = (day_gain / (total_mkt - day_gain)) * 100 if (total_mkt - day_gain) > 0 else 0
+
+kp1, kp2, kp3, kp4 = st.columns(4)
+kp1.metric("📅 今日損益", f"${day_gain:,.0f}", f"{day_pct:+.2f}%")
+kp2.metric("💰 總損益 (含已實現)", f"${(net_asset - data['principal']):,.0f}")
+kp3.metric("🏆 總報酬率", f"{roi_pct:+.2f}%")
+kp4.metric("📥 已實現損益", f"${total_realized:,.0f}")
 
 st.markdown("---")
 
