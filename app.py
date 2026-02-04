@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v4.3 (Full Dashboard Restored)"
+APP_VERSION = "v4.4 (Data Parsing Fix)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -46,16 +46,16 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
             return ws
     except: return None
 
-# --- 資料讀寫核心 ---
+# --- 資料讀寫核心 (大幅強化容錯率) ---
 def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
     
-    # 讀取 User Sheet (庫存)
+    # 1. 讀取 User Sheet (庫存)
     user_ws = get_worksheet(client, f"User_{username}")
     h_data = {}
     if user_ws:
-        all_rows = user_ws.get_all_records()
+        all_rows = user_ws.get_all_records() # 庫存結構較複雜，維持 get_all_records
         for r in all_rows:
             code = str(r.get('Code', '')).strip()
             if not code: continue
@@ -67,20 +67,42 @@ def load_data(client, username):
                 'lots': lots
             }
 
-    # 讀取 Account Sheet (資金)
+    # 2. 讀取 Account Sheet (資金)
     acc_ws = get_worksheet(client, f"Account_{username}", rows="20", cols="2")
     acc_data = {}
     if acc_ws:
         for row in acc_ws.get_all_values():
             if len(row) >= 2: acc_data[row[0]] = row[1]
 
-    # 讀取 Realized History (已實現損益)
+    # 3. 讀取 Realized History (已實現損益) - 改用 get_all_values 強制解析
+    # 預期欄位: Date(0), Code(1), Name(2), Qty(3), BuyCost(4), SellRev(5), Profit(6), ROI(7)
     hist_ws = get_worksheet(client, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
-    hist_data = hist_ws.get_all_records() if hist_ws else []
+    hist_data = []
+    if hist_ws:
+        raw_rows = hist_ws.get_all_values()
+        if len(raw_rows) > 1: # 確保有資料 (跳過標題)
+            for row in raw_rows[1:]:
+                # 補齊長度避免 index out of range
+                row += [''] * (8 - len(row))
+                hist_data.append({
+                    'Date': row[0], 'Code': row[1], 'Name': row[2], 'Qty': row[3],
+                    'BuyCost': row[4], 'SellRev': row[5], 'Profit': row[6], 'ROI': row[7]
+                })
 
-    # 讀取 Asset History (資產走勢)
+    # 4. 讀取 Asset History (資產走勢) - 改用 get_all_values 強制解析
+    # 預期欄位: Date(0), NetAsset(1), Principal(2)
     asset_ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
-    asset_history = asset_ws.get_all_records() if asset_ws else []
+    asset_history = []
+    if asset_ws:
+        raw_rows = asset_ws.get_all_values()
+        if len(raw_rows) > 1:
+            for row in raw_rows[1:]:
+                if len(row) >= 2: # 至少要有日期和淨值
+                    asset_history.append({
+                        'Date': row[0],
+                        'NetAsset': row[1],
+                        'Principal': row[2] if len(row) > 2 else row[1]
+                    })
 
     return {
         'h': h_data,
@@ -401,7 +423,15 @@ k4.metric("📉 投入本金", f"${data['principal']:,.0f}")
 k5.metric("💳 融資金額", f"${total_debt:,.0f}")
 
 st.subheader("📈 績效表現")
-total_realized = sum(float(str(r.get('Profit', 0)).replace(',','')) for r in data.get('history', []))
+
+# [Fix] 更強健的數值解析邏輯，處理 $ 符號與逗號
+def safe_parse_profit(val):
+    try:
+        s = str(val).replace(',', '').replace('$', '').replace(' ', '')
+        return float(s)
+    except: return 0.0
+
+total_realized = sum(safe_parse_profit(r.get('Profit', 0)) for r in data.get('history', []))
 day_pct = (day_gain / (total_mkt - day_gain)) * 100 if (total_mkt - day_gain) > 0 else 0
 
 kp1, kp2, kp3, kp4 = st.columns(4)
@@ -450,10 +480,16 @@ with tab3:
     hist_data = data.get('asset_history', [])
     if hist_data:
         df_h = pd.DataFrame(hist_data)
-        df_h['Date'] = pd.to_datetime(df_h['Date'])
-        df_h['NetAsset'] = pd.to_numeric(df_h['NetAsset'])
-        df_h['Principal'] = pd.to_numeric(df_h['Principal'])
-        df_h['Profit'] = df_h['NetAsset'] - df_h['Principal']
+        df_h['Date'] = pd.to_datetime(df_h['Date'], errors='coerce')
+        df_h = df_h.dropna(subset=['Date']) # 移除解析失敗的日期
+        
+        # 安全解析數值，處理可能的空白或異常字元
+        def safe_float(x):
+            try: return float(str(x).replace(',', ''))
+            except: return 0.0
+            
+        df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float)
+        df_h['Principal'] = df_h['Principal'].apply(safe_float)
         
         fig_trend = go.Figure()
         fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['NetAsset'], name='淨資產', fill='tozeroy'))
