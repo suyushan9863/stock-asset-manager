@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v5.1 (Rescue & Debug)"
+APP_VERSION = "v5.3 (Inventory Auto-Repair)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -51,20 +51,20 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
             ws = spreadsheet.add_worksheet(title=sheet_name, rows=rows, cols=cols)
             if default_header: ws.append_row(default_header)
             return ws
-    except: return None
+    except Exception as e:
+        st.sidebar.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
+        return None
 
 # --- 資料讀寫核心 ---
 def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
     
-    # 數值清理工具
     def clean_num(val):
         try:
             if isinstance(val, (int, float)): return float(val)
             if not val: return 0.0
-            # 移除常見干擾符號
-            s = str(val).replace(',', '').replace('$', '').replace(' ', '').strip()
+            s = str(val).replace(',', '').replace('$', '').replace(' ', '').replace('%', '').strip()
             return float(s)
         except: return 0.0
 
@@ -72,54 +72,81 @@ def load_data(client, username):
     user_ws = get_worksheet(client, f"User_{username}")
     h_data = {}
     if user_ws:
-        all_rows = user_ws.get_all_records()
-        for r in all_rows:
-            code = str(r.get('Code', '')).strip()
-            if not code: continue
-            try: lots = json.loads(r.get('Lots_Data', '[]'))
-            except: lots = []
-            
-            h_data[code] = {
-                'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
-                's': clean_num(r.get('Shares', 0)), 
-                'c': clean_num(r.get('AvgCost', 0)),
-                'lots': lots
-            }
+        try:
+            all_rows = user_ws.get_all_records()
+            for r in all_rows:
+                code = str(r.get('Code', '')).strip()
+                if not code: continue
+                
+                # 解析 Lots Data (這是最原始且正確的資料)
+                try: 
+                    lots = json.loads(r.get('Lots_Data', '[]'))
+                except: 
+                    lots = []
+                
+                # [Auto-Repair Logic] 
+                # 優先從 Lots 重新計算股數與成本，直接忽略 Excel 欄位中可能壞掉的數值 (如 0%)
+                if lots:
+                    calc_shares = sum(float(l.get('s', 0)) for l in lots)
+                    calc_cost_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
+                    calc_avg_cost = (calc_cost_val / calc_shares) if calc_shares > 0 else 0.0
+                    
+                    final_s = calc_shares
+                    final_c = calc_avg_cost
+                else:
+                    # 如果真的沒有 Lots，才勉強用欄位資料
+                    final_s = clean_num(r.get('Shares', 0))
+                    final_c = clean_num(r.get('AvgCost', 0))
+                
+                h_data[code] = {
+                    'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
+                    's': final_s, 
+                    'c': final_c,
+                    'lots': lots
+                }
+        except Exception as e:
+            st.error(f"庫存資料解析失敗: {e}")
 
     # 2. 讀取 Account Sheet (資金)
     acc_ws = get_worksheet(client, f"Account_{username}", rows="20", cols="2")
     acc_data = {}
     if acc_ws:
-        for row in acc_ws.get_all_values():
-            if len(row) >= 2: acc_data[row[0]] = row[1]
+        try:
+            for row in acc_ws.get_all_values():
+                if len(row) >= 2: acc_data[row[0]] = row[1]
+        except: pass
 
     # 3. 讀取 Realized History (已實現損益)
     hist_ws = get_worksheet(client, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
     hist_data = []
     if hist_ws:
-        raw_rows = hist_ws.get_all_values()
-        if len(raw_rows) > 1:
-            for row in raw_rows[1:]:
-                row += [''] * (8 - len(row)) # 補齊欄位
-                hist_data.append({
-                    'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 
-                    'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 
-                    'Profit': row[6], 'ROI': row[7]
-                })
+        try:
+            raw_rows = hist_ws.get_all_values()
+            if len(raw_rows) > 1:
+                for row in raw_rows[1:]:
+                    row += [''] * (8 - len(row))
+                    hist_data.append({
+                        'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 
+                        'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 
+                        'Profit': row[6], 'ROI': row[7]
+                    })
+        except: pass
 
     # 4. 讀取 Asset History (資產走勢)
     asset_ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
     asset_history = []
     if asset_ws:
-        raw_rows = asset_ws.get_all_values()
-        if len(raw_rows) > 1:
-            for row in raw_rows[1:]:
-                if len(row) >= 2:
-                    asset_history.append({
-                        'Date': str(row[0]),
-                        'NetAsset': clean_num(row[1]),
-                        'Principal': clean_num(row[2]) if len(row) > 2 else clean_num(row[1])
-                    })
+        try:
+            raw_rows = asset_ws.get_all_values()
+            if len(raw_rows) > 1:
+                for row in raw_rows[1:]:
+                    if len(row) >= 2:
+                        asset_history.append({
+                            'Date': str(row[0]),
+                            'NetAsset': clean_num(row[1]),
+                            'Principal': clean_num(row[2]) if len(row) > 2 else clean_num(row[1])
+                        })
+        except: pass
 
     return {
         'h': h_data,
@@ -134,13 +161,11 @@ def load_data(client, username):
 def save_data(client, username, data):
     if not client: return
     
-    # 存資金
     acc_ws = get_worksheet(client, f"Account_{username}")
     if acc_ws:
         acc_ws.clear()
         acc_ws.update('A1', [['Key', 'Value'], ['Cash', data['cash']], ['Principal', data['principal']], ['LastUpdate', data.get('last_update', '')], ['USDTWD', data.get('usdtwd', 32.5)]])
 
-    # 存庫存
     user_ws = get_worksheet(client, f"User_{username}")
     if user_ws:
         headers = ['Code', 'Name', 'Exchange', 'Shares', 'AvgCost', 'Lots_Data']
@@ -181,15 +206,14 @@ def get_audit_logs(client, username, limit=50):
 # --- 災難恢復：從 Audit 重建庫存 (強化版) ---
 def reconstruct_inventory_from_audit(client, username):
     ws = get_worksheet(client, f"Audit_{username}")
-    if not ws: return {}, "找不到 Audit 資料表"
+    if not ws: return {}, "錯誤：無法連線到 Audit 資料表，請使用診斷功能確認分頁是否存在。"
     
     rows = ws.get_all_values()
-    if len(rows) < 2: return {}, "Audit 資料表為空 (只有標題或無資料)"
+    if len(rows) < 2: return {}, "Audit 資料表是空的，無法重建。"
     
     recon_h = {}
     stats = {'buy': 0, 'sell': 0, 'error': 0}
     
-    # 數值清理 (處理 $ 和 ,)
     def clean_audit_num(s):
         return float(str(s).replace(',', '').replace('$', '').replace(' ', '').strip())
 
@@ -204,7 +228,6 @@ def reconstruct_inventory_from_audit(client, username):
             stats['error'] += 1
             continue
         
-        # 解析代碼
         code = raw_code.split('_')[0].strip().upper()
         name_hint = raw_code.split('_')[1] if '_' in raw_code else code
         
@@ -255,6 +278,14 @@ def reconstruct_inventory_from_audit(client, username):
                 
     msg = f"掃描完成: 發現 {stats['buy']} 筆買入, {stats['sell']} 筆賣出, 忽略 {stats['error']} 筆異常格式。"
     return recon_h, msg
+
+# --- 診斷功能：列出所有分頁 ---
+def list_all_sheets(client):
+    try:
+        spreadsheet = client.open(st.secrets["spreadsheet_name"])
+        return [ws.title for ws in spreadsheet.worksheets()]
+    except Exception as e:
+        return [f"Error: {str(e)}"]
 
 # --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
@@ -347,7 +378,9 @@ if not st.session_state.current_user:
             if st.form_submit_button("Login", use_container_width=True):
                 users = st.secrets.get("passwords", {})
                 if u in users and str(users[u]) == str(p):
-                    st.session_state.current_user = u; st.rerun()
+                    # [Fix] 登入時強制去除空白，避免對應不到 Sheet
+                    st.session_state.current_user = u.strip()
+                    st.rerun()
                 else: st.error("Failed")
     st.stop()
 
@@ -404,6 +437,7 @@ with st.sidebar:
                     tot_c = sum(l['s'] * l['p'] for l in h['lots'])
                     h['s'] = tot_s
                     h['c'] = tot_c / tot_s if tot_s else 0
+                    
                     save_data(client, username, data)
                     log_transaction(client, username, "買入", b_code, b_price, b_qty)
                     st.success(f"買入 {b_code} 成功"); time.sleep(1); st.rerun()
@@ -458,14 +492,21 @@ with st.sidebar:
     
     st.markdown("---")
     with st.expander("⛑️ 災難恢復 / 資料救援", expanded=True):
-        st.warning("如果您的庫存消失，請先檢查下方原始檔案，再執行重建。")
+        st.warning("請先執行診斷，確認資料存在後再重建。")
         
+        # [New Feature] 診斷所有資料表名稱，確認是否使用者名稱打錯
+        if st.button("🕵️‍♀️ 診斷：列出所有資料表"):
+            sheets = list_all_sheets(client)
+            st.write("目前 Google Sheet 內的所有分頁名稱：")
+            st.json(sheets)
+            st.info(f"系統目前嘗試讀取的目標為: Audit_{username}")
+
         if st.button("👁️ 檢視原始交易檔案"):
             raw_audit = get_audit_logs(client, username, 1000)
             if raw_audit:
                 st.dataframe(pd.DataFrame(raw_audit, columns=['Time', 'Action', 'Code', 'Amount', 'Shares', 'Memo']), use_container_width=True)
             else:
-                st.error("警告：讀取不到原始交易檔案，這可能是檔案被刪除或權限問題。")
+                st.error(f"嚴重警告：讀取不到 Audit_{username}，請先執行上方「診斷」確認分頁名稱是否正確。")
 
         if st.button("🛠️ 強制執行庫存重建", type="primary"):
             with st.spinner("正在強制解析並重建庫存..."):
