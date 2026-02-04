@@ -436,8 +436,8 @@ for code, info in data['h'].items():
     
     table_rows.append({
         "代碼": code, "名稱": info.get('n'), 
-        "股數": f"{qty:,.0f}", 
-        "成本": f"{cost:,.2f}", "現價": f"{curr_p:,.2f}",
+        "股數": qty, 
+        "成本": cost, "現價": curr_p,
         "日損益": q.get('chg', 0), "日漲跌幅": q.get('pct', 0) / 100,
         "總損益": p_gain, "報酬率": p_roi,
         "市值": mkt_val
@@ -466,7 +466,8 @@ if table_rows:
 
     st.dataframe(
         df.style.format({
-            "現價": "{:.2f}", "日損益": "{:+.2f}", "日漲跌幅": "{:+.2%}",
+            "股數": "{:,.0f}", "成本": "{:,.2f}", "現價": "{:.2f}",
+            "日損益": "{:+.2f}", "日漲跌幅": "{:+.2%}",
             "總損益": "{:+,.0f}", "報酬率": "{:+.2%}", "市值": "{:,.0f}"
         }).map(style_color, subset=['日損益', '日漲跌幅', '總損益', '報酬率']),
         use_container_width=True,
