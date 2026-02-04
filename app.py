@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v2.9 (Hotfix 2)"
+APP_VERSION = "v3.0 (Final Polish)"
 
 # 設定頁面配置
 st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
@@ -387,6 +387,11 @@ def get_usdtwd():
     except: return 32.5
 
 def fetch_twse_realtime(codes):
+    """
+    [v3.0] 股價抓取優化版：
+    1. 支援回傳公司名稱 'n'，解決顯示為代碼的問題。
+    2. 強化代碼比對。
+    """
     if not codes: return {}
     
     query_str = "|".join(codes)
@@ -412,6 +417,9 @@ def fetch_twse_realtime(codes):
                 c = item.get('c', '')
                 ex = item.get('ex', '')
                 
+                # 擷取名稱 (v3.0 關鍵新增)
+                name = item.get('n', '')
+                
                 price_str = item.get('z', '-')
                 if price_str == '-':
                     bid = item.get('b', '').split('_')[0]
@@ -427,7 +435,8 @@ def fetch_twse_realtime(codes):
                 change_val = price - prev_close if price > 0 else 0.0
                 change_pct = (change_val / prev_close * 100) if prev_close > 0 else 0.0
 
-                res_obj = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'realtime': True}
+                # 將名稱 'n' 也放入回傳結構
+                res_obj = {'p': price, 'chg': change_val, 'chg_pct': change_pct, 'n': name, 'realtime': True}
 
                 results[c] = res_obj
                 if ex == 'tse': results[f"{c}.TW"] = res_obj
@@ -452,7 +461,7 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
 
         if is_tw:
             prefix = 'otc' if ex in ['otc', 'TWO'] else 'tse'
-            # --- [v2.9 Fix] 移除多餘後綴，防止 tse_2330.TW.tw 的錯誤查詢 ---
+            # [v3.0] 確保代碼乾淨 (移除後綴)
             clean_code = s_code.upper().replace('.TW', '').replace('.TWO', '')
             tw_query.append(f"{prefix}_{clean_code}.tw")
         else:
@@ -481,7 +490,7 @@ def get_batch_market_data(portfolio_dict, usdtwd_rate):
 
     for c in portfolio_dict.keys():
         if c not in results:
-             results[c] = {'p': 0, 'chg': 0, 'chg_pct': 0}
+             results[c] = {'p': 0, 'chg': 0, 'chg_pct': 0, 'n': ''}
 
     if 'manual_prices' in st.session_state:
         for m_code, m_price in st.session_state.manual_prices.items():
@@ -531,10 +540,19 @@ def update_dashboard_data(use_realtime=True):
                 if str(code)[0].isdigit(): info['ex'] = 'tse'
 
             if use_realtime:
-                market_info = batch_prices.get(code, {'p': info.get('c', 0), 'chg': 0, 'chg_pct': 0})
+                market_info = batch_prices.get(code, {'p': info.get('c', 0), 'chg': 0, 'chg_pct': 0, 'n': ''})
                 info['last_p'] = market_info['p']
                 info['last_chg'] = market_info['chg']
                 info['last_chg_pct'] = market_info['chg_pct']
+                
+                # --- [v3.0] 自動修復名稱邏輯 ---
+                # 如果目前名稱是空的，或名稱跟代碼一樣，且 API 有抓到真名 -> 更新
+                current_name = info.get('n', '').strip()
+                fetched_name = market_info.get('n', '').strip()
+                
+                if (not current_name or current_name == str(code)) and fetched_name:
+                    info['n'] = fetched_name
+                # ------------------------------
             else:
                 last_p = info.get('last_p', info.get('c', 0))
                 last_chg = info.get('last_chg', 0)
@@ -731,13 +749,10 @@ if not st.session_state.current_user:
 @st.dialog("📜 版本修改歷程")
 def show_changelog():
     st.markdown("""
-    **v2.9 Hotfix 2**
-    1.  **查詢格式修正**: 修復當股票代碼已包含 `.TW` 後綴時 (如 `2327.TW`)，系統重複添加後綴導致查詢失敗的問題。
-    2.  **即時報價恢復**: 修正後應可正常抓取現價，解決日損益顯示為 0 的狀況。
-    
-    **v2.8 Stability Fix**
-    1.  **修復語法錯誤**: 修正 `except` 敘述不完整的 SyntaxError。
-    2.  **安全性增強**: 核心計算邏輯加入 Try-Catch 保護，防止畫面白屏。
+    **v3.0 Final Polish**
+    1.  **自動名稱修復 (Auto-Heal)**: 系統會嘗試從即時報價中抓取公司名稱，解決名稱顯示為代碼的問題。
+    2.  **查詢格式優化**: 內建代碼清洗邏輯 (Clean Suffix)，完美解決證交所查詢失敗問題。
+    3.  **會計邏輯確認**: 本金存提採用標準「淨投入」計算模式。
     """)
 
 # --- 主程式 ---
@@ -796,6 +811,7 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("💵 資金存提 (影響本金)"):
+        st.caption("存入資金：現金增加，本金增加。\n取出資金：現金減少，本金減少。")
         if "fund_op_val" not in st.session_state: st.session_state.fund_op_val = 0.0
         if st.session_state.get("reset_fund"):
              st.session_state.fund_op_val = 0.0
@@ -877,7 +893,9 @@ with st.sidebar:
                     data['h'][final_code]['s'] = tot_s
                     data['h'][final_code]['c'] = tot_c_val / tot_s if tot_s else 0
                     data['h'][final_code]['lots'] = lots
-                    data['h'][final_code]['n'] = checked_name
+                    # [v3.0] 如果 resolve_stock_info 抓到的名稱是代碼，但我們有舊名稱，保留舊名稱
+                    if checked_name != final_code:
+                        data['h'][final_code]['n'] = checked_name
                     data['h'][final_code]['ex'] = ex_type
                 else:
                     data['h'][final_code] = {'s': shares_in, 'c': final_cost, 'n': checked_name, 'lots': [new_lot], 'ex': ex_type}
@@ -886,6 +904,8 @@ with st.sidebar:
                     data['h'][final_code]['last_p'] = fetched_p
                     data['h'][final_code]['last_chg'] = q_info.get('chg', 0)
                     data['h'][final_code]['last_chg_pct'] = q_info.get('chg_pct', 0)
+                    # [v3.0] 買入時即時更新名稱
+                    if q_info.get('n'): data['h'][final_code]['n'] = q_info['n']
 
                 save_data(client, username, data)
                 log_msg = f"新增庫存 ({datetime.now().strftime('%Y-%m-%d')})"
