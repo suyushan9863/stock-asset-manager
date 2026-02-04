@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v5.3 (Inventory Auto-Repair)"
+APP_VERSION = "v6.0 (Stable Release)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -52,10 +52,11 @@ def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None
             if default_header: ws.append_row(default_header)
             return ws
     except Exception as e:
+        # 這裡保留錯誤提示，若是連線問題方便排查
         st.sidebar.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
         return None
 
-# --- 資料讀寫核心 ---
+# --- 資料讀寫核心 (保留自動校正邏輯) ---
 def load_data(client, username):
     default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
     if not client or not username: return default
@@ -64,6 +65,7 @@ def load_data(client, username):
         try:
             if isinstance(val, (int, float)): return float(val)
             if not val: return 0.0
+            # 強力移除所有非數值字元
             s = str(val).replace(',', '').replace('$', '').replace(' ', '').replace('%', '').strip()
             return float(s)
         except: return 0.0
@@ -78,14 +80,14 @@ def load_data(client, username):
                 code = str(r.get('Code', '')).strip()
                 if not code: continue
                 
-                # 解析 Lots Data (這是最原始且正確的資料)
+                # 解析 Lots Data
                 try: 
                     lots = json.loads(r.get('Lots_Data', '[]'))
                 except: 
                     lots = []
                 
-                # [Auto-Repair Logic] 
-                # 優先從 Lots 重新計算股數與成本，直接忽略 Excel 欄位中可能壞掉的數值 (如 0%)
+                # [核心邏輯] 始終以 Lots 明細重新計算股數與成本，確保資料正確性
+                # 這能防止 Google Sheet 欄位格式跑掉的問題
                 if lots:
                     calc_shares = sum(float(l.get('s', 0)) for l in lots)
                     calc_cost_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
@@ -94,7 +96,6 @@ def load_data(client, username):
                     final_s = calc_shares
                     final_c = calc_avg_cost
                 else:
-                    # 如果真的沒有 Lots，才勉強用欄位資料
                     final_s = clean_num(r.get('Shares', 0))
                     final_c = clean_num(r.get('AvgCost', 0))
                 
@@ -161,11 +162,13 @@ def load_data(client, username):
 def save_data(client, username, data):
     if not client: return
     
+    # 存資金
     acc_ws = get_worksheet(client, f"Account_{username}")
     if acc_ws:
         acc_ws.clear()
         acc_ws.update('A1', [['Key', 'Value'], ['Cash', data['cash']], ['Principal', data['principal']], ['LastUpdate', data.get('last_update', '')], ['USDTWD', data.get('usdtwd', 32.5)]])
 
+    # 存庫存 - 確保寫入純數字，修正 Google Sheet 格式
     user_ws = get_worksheet(client, f"User_{username}")
     if user_ws:
         headers = ['Code', 'Name', 'Exchange', 'Shares', 'AvgCost', 'Lots_Data']
@@ -173,7 +176,7 @@ def save_data(client, username, data):
         for code, info in data.get('h', {}).items():
             rows.append([
                 code, info.get('n', ''), info.get('ex', ''),
-                info.get('s', 0), info.get('c', 0),
+                float(info.get('s', 0)), float(info.get('c', 0)), # 強制轉 float 寫入
                 json.dumps(info.get('lots', []), ensure_ascii=False)
             ])
         user_ws.clear()
@@ -202,90 +205,6 @@ def get_audit_logs(client, username, limit=50):
         vals = ws.get_all_values()
         if len(vals) > 1: return vals[1:][-limit:][::-1]
     return []
-
-# --- 災難恢復：從 Audit 重建庫存 (強化版) ---
-def reconstruct_inventory_from_audit(client, username):
-    ws = get_worksheet(client, f"Audit_{username}")
-    if not ws: return {}, "錯誤：無法連線到 Audit 資料表，請使用診斷功能確認分頁是否存在。"
-    
-    rows = ws.get_all_values()
-    if len(rows) < 2: return {}, "Audit 資料表是空的，無法重建。"
-    
-    recon_h = {}
-    stats = {'buy': 0, 'sell': 0, 'error': 0}
-    
-    def clean_audit_num(s):
-        return float(str(s).replace(',', '').replace('$', '').replace(' ', '').strip())
-
-    for r in rows[1:]:
-        if len(r) < 5: 
-            stats['error'] += 1
-            continue
-            
-        action = str(r[1]).strip()
-        raw_code = str(r[2]).strip()
-        if not raw_code: 
-            stats['error'] += 1
-            continue
-        
-        code = raw_code.split('_')[0].strip().upper()
-        name_hint = raw_code.split('_')[1] if '_' in raw_code else code
-        
-        try:
-            qty = clean_audit_num(r[4])
-            price = clean_audit_num(r[3])
-        except: 
-            stats['error'] += 1
-            continue
-        
-        if code not in recon_h:
-            is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
-            recon_h[code] = {
-                'n': name_hint, 
-                'ex': 'TW' if is_tw else 'US', 
-                's': 0.0, 'c': 0.0, 'lots': []
-            }
-            
-        curr = recon_h[code]
-        
-        if action == '買入':
-            stats['buy'] += 1
-            new_lot = {'d': r[0], 'p': price, 's': qty, 'debt': 0}
-            curr['lots'].append(new_lot)
-            prev_s = curr['s']
-            prev_cost_total = prev_s * curr['c']
-            new_s = prev_s + qty
-            new_cost_total = prev_cost_total + (qty * price)
-            curr['s'] = new_s
-            curr['c'] = new_cost_total / new_s if new_s > 0 else 0
-            
-        elif action == '賣出':
-            stats['sell'] += 1
-            curr['s'] = max(0, curr['s'] - qty)
-            remain = qty
-            new_lots = []
-            for lot in curr['lots']:
-                if remain > 0:
-                    take = min(lot['s'], remain)
-                    lot['s'] -= take
-                    remain -= take
-                    if lot['s'] > 0: new_lots.append(lot)
-                else:
-                    new_lots.append(lot)
-            curr['lots'] = new_lots
-            if curr['s'] <= 0.01:
-                del recon_h[code]
-                
-    msg = f"掃描完成: 發現 {stats['buy']} 筆買入, {stats['sell']} 筆賣出, 忽略 {stats['error']} 筆異常格式。"
-    return recon_h, msg
-
-# --- 診斷功能：列出所有分頁 ---
-def list_all_sheets(client):
-    try:
-        spreadsheet = client.open(st.secrets["spreadsheet_name"])
-        return [ws.title for ws in spreadsheet.worksheets()]
-    except Exception as e:
-        return [f"Error: {str(e)}"]
 
 # --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
@@ -378,7 +297,7 @@ if not st.session_state.current_user:
             if st.form_submit_button("Login", use_container_width=True):
                 users = st.secrets.get("passwords", {})
                 if u in users and str(users[u]) == str(p):
-                    # [Fix] 登入時強制去除空白，避免對應不到 Sheet
+                    # 強制去除空白
                     st.session_state.current_user = u.strip()
                     st.rerun()
                 else: st.error("Failed")
@@ -489,36 +408,6 @@ with st.sidebar:
     if st.button("📋 異動歷程"):
         logs = get_audit_logs(client, username)
         show_audit_log_modal(logs)
-    
-    st.markdown("---")
-    with st.expander("⛑️ 災難恢復 / 資料救援", expanded=True):
-        st.warning("請先執行診斷，確認資料存在後再重建。")
-        
-        # [New Feature] 診斷所有資料表名稱，確認是否使用者名稱打錯
-        if st.button("🕵️‍♀️ 診斷：列出所有資料表"):
-            sheets = list_all_sheets(client)
-            st.write("目前 Google Sheet 內的所有分頁名稱：")
-            st.json(sheets)
-            st.info(f"系統目前嘗試讀取的目標為: Audit_{username}")
-
-        if st.button("👁️ 檢視原始交易檔案"):
-            raw_audit = get_audit_logs(client, username, 1000)
-            if raw_audit:
-                st.dataframe(pd.DataFrame(raw_audit, columns=['Time', 'Action', 'Code', 'Amount', 'Shares', 'Memo']), use_container_width=True)
-            else:
-                st.error(f"嚴重警告：讀取不到 Audit_{username}，請先執行上方「診斷」確認分頁名稱是否正確。")
-
-        if st.button("🛠️ 強制執行庫存重建", type="primary"):
-            with st.spinner("正在強制解析並重建庫存..."):
-                restored_h, msg = reconstruct_inventory_from_audit(client, username)
-                if restored_h:
-                    data['h'] = restored_h
-                    save_data(client, username, data)
-                    st.success(f"{msg} 請重新整理頁面。")
-                    time.sleep(3)
-                    st.rerun()
-                else:
-                    st.error(f"重建失敗: {msg}")
 
 st.title(f"📈 資產管家")
 
@@ -622,7 +511,7 @@ with tab1:
             use_container_width=True, hide_index=True, height=500
         )
     else:
-        st.info("⚠️ 尚無庫存顯示。若您確定持有股票但未顯示，請使用左側選單下方的「⛑️ 災難恢復」功能。")
+        st.info("尚無庫存，請從左側新增。")
 
 with tab2:
     if table_rows:
