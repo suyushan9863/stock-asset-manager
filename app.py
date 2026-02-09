@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v7.2 (Compatibility Fix)"
+APP_VERSION = "v7.3 (Legacy Format Fix)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -40,8 +40,7 @@ def get_google_client():
         
         # 判斷 secret 是字串還是 dict
         if isinstance(secret_info, str):
-            # --- 關鍵修復：加入 strict=False ---
-            #這允許 json 解析包含控制字元(如換行)的字串，解決 "Invalid control character" 錯誤
+            # 這允許 json 解析包含控制字元(如換行)的字串，解決 "Invalid control character" 錯誤
             creds_dict = json.loads(secret_info, strict=False)
         else:
             # 如果是 TOML 格式讀進來會是 Object，直接轉成 Dict
@@ -70,10 +69,10 @@ def get_worksheet(spreadsheet, sheet_name, rows="100", cols="10", default_header
         st.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
         st.stop() # 讀取分頁失敗也停止
 
-# --- 資料讀寫核心 (安全版) ---
+# --- 資料讀寫核心 (含舊版格式相容) ---
 def load_data(client, username):
     username = username.strip().lower() # 強制轉小寫
-    default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
+    default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': [], 'is_legacy': False}
     
     if not client or not username: return default
 
@@ -92,8 +91,11 @@ def load_data(client, username):
             return float(s)
         except: return 0.0
 
-    # 1. 讀取 User (庫存)
+    # 1. 讀取 User (庫存) - 支援新舊兩種格式
     h_data = {}
+    legacy_json = None
+    is_legacy = False
+    
     try:
         try:
             user_ws = spreadsheet.worksheet(f"User_{username}")
@@ -101,42 +103,88 @@ def load_data(client, username):
             # 只有確定是新用戶才回傳空值，不報錯
             return default
             
-        all_rows = user_ws.get_all_records()
-        for r in all_rows:
-            code = str(r.get('Code', '')).strip()
-            if not code: continue
-            
-            try: lots = json.loads(r.get('Lots_Data', '[]'))
-            except: lots = []
-            
-            final_s = clean_num(r.get('Shares', 0))
-            final_c = clean_num(r.get('AvgCost', 0))
-            
-            # 若有 lots 資料則以 lots 為準重算
-            if lots:
-                calc_s = sum(float(l.get('s', 0)) for l in lots)
-                calc_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
-                final_s = calc_s
-                final_c = (calc_val / calc_s) if calc_s > 0 else 0.0
-            
-            h_data[code] = {
-                'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
-                's': final_s, 'c': final_c,
-                'last_p': clean_num(r.get('LastPrice', 0)),
-                'lots': lots
-            }
+        all_rows_vals = user_ws.get_all_values()
+        
+        # --- 偵測是否為舊版 JSON 格式 ---
+        # 舊版特徵：第一列第一格以 "{" 開頭，且沒有 "Code" 欄位表頭
+        if all_rows_vals and len(all_rows_vals) > 0:
+            first_cell = str(all_rows_vals[0][0]).strip()
+            if first_cell.startswith('{') and "Code" not in all_rows_vals[0]:
+                is_legacy = True
+        
+        if is_legacy:
+            # === 舊版格式讀取邏輯 ===
+            try:
+                # 嘗試解析 A1 儲存格的 JSON
+                raw_json = all_rows_vals[0][0]
+                legacy_json = json.loads(raw_json)
+                
+                # 轉移持股 (h)
+                raw_h = legacy_json.get('h', {})
+                for code, info in raw_h.items():
+                    h_data[code] = {
+                        'n': info.get('n', code), # 舊版可能沒有名字
+                        'ex': info.get('ex', ''),
+                        's': clean_num(info.get('s', 0)),
+                        'c': clean_num(info.get('c', 0)),
+                        'last_p': 0, # 舊版 JSON 通常不存 last_p
+                        'lots': info.get('lots', [])
+                    }
+            except Exception as e:
+                st.error(f"⚠️ 舊版資料解析失敗: {e}")
+        else:
+            # === 新版表格格式讀取邏輯 (原程式碼) ===
+            all_records = user_ws.get_all_records()
+            for r in all_records:
+                code = str(r.get('Code', '')).strip()
+                if not code: continue
+                
+                try: lots = json.loads(r.get('Lots_Data', '[]'))
+                except: lots = []
+                
+                final_s = clean_num(r.get('Shares', 0))
+                final_c = clean_num(r.get('AvgCost', 0))
+                
+                # 若有 lots 資料則以 lots 為準重算
+                if lots:
+                    calc_s = sum(float(l.get('s', 0)) for l in lots)
+                    calc_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
+                    final_s = calc_s
+                    final_c = (calc_val / calc_s) if calc_s > 0 else 0.0
+                
+                h_data[code] = {
+                    'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
+                    's': final_s, 'c': final_c,
+                    'last_p': clean_num(r.get('LastPrice', 0)),
+                    'lots': lots
+                }
+
     except Exception as e:
         st.error(f"⚠️ 讀取庫存資料發生錯誤: {e}")
-        st.stop() # 讀取錯誤時強制停止，保護資料
+        st.stop()
 
     # 2. 讀取 Account (資金)
     acc_data = {}
+    # 預設使用舊版 JSON 中的資金 (如果有的話)
+    cash_val = clean_num(legacy_json.get('cash', 0)) if legacy_json else 0.0
+    principal_val = clean_num(legacy_json.get('principal', 0)) if legacy_json else 0.0
+    last_update_val = ""
+    usdtwd_val = 32.5
+
     try:
         acc_ws = spreadsheet.worksheet(f"Account_{username}")
         for row in acc_ws.get_all_values():
             if len(row) >= 2: acc_data[row[0]] = row[1]
+        
+        # 如果有讀到新版 Account 分頁，則覆蓋舊版數值
+        if acc_data:
+            cash_val = clean_num(acc_data.get('Cash', cash_val))
+            principal_val = clean_num(acc_data.get('Principal', principal_val))
+            last_update_val = acc_data.get('LastUpdate', '')
+            usdtwd_val = clean_num(acc_data.get('USDTWD', 32.5))
+            
     except gspread.exceptions.WorksheetNotFound:
-        # 如果找不到帳戶頁面，不視為錯誤，使用預設值
+        # 找不到帳戶頁面沒關係，沿用 legacy 數值
         pass
     except Exception as e:
         st.error(f"⚠️ 讀取帳戶資金失敗: {e}")
@@ -145,11 +193,24 @@ def load_data(client, username):
     # 3. 讀取歷史與已實現
     hist_data = []
     asset_history = []
+    
+    # 優先從舊版 JSON 讀取歷史紀錄
+    if legacy_json and 'history' in legacy_json:
+        for h in legacy_json['history']:
+            hist_data.append({
+                'Date': h.get('d'), 'Code': h.get('code'), 'Name': h.get('name'),
+                'Qty': h.get('qty'), 'BuyCost': h.get('buy_cost'), 
+                'SellRev': h.get('sell_rev'), 'Profit': h.get('profit'), 'ROI': h.get('roi')
+            })
+
     try:
         try:
+            # 嘗試讀取新版 Realized 分頁，如果有資料則覆蓋/補充
             h_ws = spreadsheet.worksheet(f"Realized_{username}")
             raw_h = h_ws.get_all_values()
             if len(raw_h) > 1:
+                # 如果新版表單有資料，我們以新版為主（或者這裡可以做合併，目前假設新版存在就用新版）
+                hist_data = [] 
                 for row in raw_h[1:]:
                     row += [''] * (8 - len(row))
                     hist_data.append({'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 'Profit': row[6], 'ROI': row[7]})
@@ -167,15 +228,16 @@ def load_data(client, username):
 
     return {
         'h': h_data,
-        'cash': clean_num(acc_data.get('Cash', 0)),
-        'principal': clean_num(acc_data.get('Principal', 0)),
-        'last_update': acc_data.get('LastUpdate', ''),
-        'usdtwd': clean_num(acc_data.get('USDTWD', 32.5)),
+        'cash': cash_val,
+        'principal': principal_val,
+        'last_update': last_update_val,
+        'usdtwd': usdtwd_val,
         'history': hist_data,
-        'asset_history': asset_history
+        'asset_history': asset_history,
+        'is_legacy': is_legacy
     }
 
-# --- 存檔功能 (安全版：增加資料為空時的防寫入鎖) ---
+# --- 存檔功能 (安全版) ---
 def save_data(client, username, data):
     username = username.strip().lower()
     if not client: return
@@ -371,6 +433,48 @@ if 'data' not in st.session_state or st.session_state.get('loaded_user') != user
     st.session_state.data = load_data(client, username)
     st.session_state.loaded_user = username
 data = st.session_state.data
+
+# --- 自動遷移邏輯 ---
+# 只有當檢測到是 Legacy 模式且資料成功讀取後才執行
+if data.get('is_legacy', False):
+    with st.spinner("🔄 偵測到舊版資料格式，正在自動進行格式升級與遷移..."):
+        try:
+            # 1. 儲存 User (轉為表格) 和 Account
+            save_data(client, username, data)
+            
+            # 2. 遷移歷史紀錄 (因為 save_data 不會寫入歷史紀錄分頁)
+            if data['history']:
+                spreadsheet = client.open(st.secrets["spreadsheet_name"])
+                # 檢查 Realized 分頁是否存在
+                try:
+                    r_ws = spreadsheet.worksheet(f"Realized_{username}")
+                    # 如果已經存在且有資料，可能不需要遷移，避免重複
+                    if len(r_ws.get_all_values()) <= 1: 
+                        raise Exception("Empty sheet")
+                except:
+                    # 建立或寫入
+                    try: r_ws = spreadsheet.worksheet(f"Realized_{username}")
+                    except: r_ws = spreadsheet.add_worksheet(f"Realized_{username}", 100, 10)
+                    
+                    r_ws.clear()
+                    r_ws.append_row(['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
+                    
+                    rows_to_add = []
+                    for h in data['history']:
+                        rows_to_add.append([
+                            h.get('Date'), h.get('Code'), h.get('Name'), 
+                            h.get('Qty'), h.get('BuyCost'), h.get('SellRev'), 
+                            h.get('Profit'), h.get('ROI')
+                        ])
+                    if rows_to_add:
+                        r_ws.append_rows(rows_to_add)
+
+            st.toast("✅ 資料格式升級完成！", icon="🎉")
+            data['is_legacy'] = False
+            time.sleep(1)
+            st.rerun()
+        except Exception as e:
+            st.error(f"遷移失敗: {e}")
 
 with st.sidebar:
     st.title(f"👤 {username}")
