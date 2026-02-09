@@ -493,4 +493,175 @@ for code, info in data['h'].items():
         q = {'chg': 0, 'pct': 0, 'n': info.get('n', code)}
 
     current_name = str(info.get('n', '')).strip()
-    if q.get('n') and
+    if q.get('n') and (not current_name or current_name == code):
+        info['n'] = q['n']
+    
+    s_code = str(code).upper()
+    is_tw = ('.TW' in s_code) or ('.TWO' in s_code) or (s_code.replace('.TW','').replace('.TWO','').isdigit())
+    rate = 1.0 if is_tw else data.get('usdtwd', 32.5)
+    
+    qty = info['s']
+    cost = info['c']
+    
+    mkt_val = qty * curr_p * rate
+    cost_val = qty * cost * rate
+    stock_debt = sum(l.get('debt', 0) for l in info['lots'])
+    
+    total_mkt += mkt_val
+    total_cost += cost_val
+    total_debt += stock_debt
+    day_gain += (q.get('chg', 0) * qty * rate)
+    
+    p_gain = mkt_val - cost_val
+    p_roi = (p_gain / (cost_val - stock_debt)) if (cost_val - stock_debt) > 0 else 0
+    
+    table_rows.append({
+        "股票代碼": code, "公司名稱": info.get('n'), "股數": qty, 
+        "成本": cost, "現價": curr_p,
+        "日損益%": q.get('pct', 0) / 100, "日損益": q.get('chg', 0) * qty * rate,
+        "總損益%": p_roi, "總損益": p_gain, "市值": mkt_val, "mkt_val_raw": mkt_val
+    })
+
+# 補算佔比
+for row in table_rows:
+    row["占比"] = (row["mkt_val_raw"] / total_mkt) if total_mkt > 0 else 0
+
+net_asset = data['cash'] + total_mkt - total_debt
+roi_pct = ((net_asset - data['principal']) / data['principal'] * 100) if data['principal'] else 0
+
+# 更新股價與紀錄
+if st.button("🔄 更新即時股價", type="primary", use_container_width=True):
+    with st.spinner("更新中... (優先使用 TWSE)"):
+        data['usdtwd'] = get_usdtwd()
+        st.session_state.quotes = update_prices_batch(data['h'])
+        data['last_update'] = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
+        save_data(client, username, data)
+        record_asset_history(client, username, net_asset, data['principal'])
+        st.rerun()
+
+st.subheader("🏦 資產概況")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("💰 淨資產", f"${net_asset:,.0f}")
+k2.metric("💵 現金餘額", f"${data['cash']:,.0f}")
+k3.metric("📊 證券市值", f"${total_mkt:,.0f}")
+k4.metric("📉 投入本金", f"${data['principal']:,.0f}")
+
+st.subheader("📈 績效表現")
+
+def safe_sum_profit(val):
+    try:
+        if isinstance(val, (int, float)): return float(val)
+        s = str(val).replace(',', '').replace('$', '').replace(' ', '').replace('+', '')
+        return float(s)
+    except: return 0.0
+
+total_realized = sum(safe_sum_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
+total_profit_all = (net_asset - data['principal']) 
+
+kp1, kp2, kp3, kp4 = st.columns(4)
+kp1.metric("📅 今日損益", f"${day_gain:,.0f}")
+kp2.metric("💰 總損益 (含已實現)", f"${total_profit_all:,.0f}")
+kp3.metric("🏆 總報酬率 (ROI)", f"{roi_pct:+.2f}%")
+kp4.metric("📥 其中已實現", f"${total_realized:,.0f}")
+
+st.markdown("---")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
+
+def style_color(v):
+    try: return 'color: red' if float(v) > 0 else 'color: green' if float(v) < 0 else ''
+    except: return ''
+
+with tab1:
+    if table_rows:
+        df = pd.DataFrame(table_rows).drop(columns=['mkt_val_raw'])
+        cols = ["股票代碼", "公司名稱", "股數", "成本", "現價", "日損益%", "日損益", "總損益%", "總損益", "市值", "占比"]
+        df = df[cols]
+        
+        st.dataframe(
+            df.style.format({
+                "股數": "{:,.0f}", "成本": "{:,.2f}", "現價": "{:.2f}",
+                "日損益%": "{:+.2%}", "日損益": "{:+,.0f}",
+                "總損益%": "{:+.2%}", "總損益": "{:+,.0f}", "市值": "{:,.0f}",
+                "占比": "{:.1%}"
+            }).map(style_color, subset=['日損益%', '日損益', '總損益%', '總損益']),
+            use_container_width=True, hide_index=True, height=500
+        )
+    else:
+        st.info("⚠️ 尚無庫存顯示。")
+
+with tab2:
+    if table_rows:
+        df_tree = pd.DataFrame(table_rows)
+        fig = px.treemap(
+            df_tree, path=['股票代碼'], values='mkt_val_raw', color='日損益%',
+            color_continuous_scale='RdYlGn_r', color_continuous_midpoint=0,
+            hover_data=['公司名稱', '總損益', '總損益%']
+        )
+        fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("尚無資料")
+
+with tab3:
+    hist_data = data.get('asset_history', [])
+    if hist_data:
+        df_h = pd.DataFrame(hist_data)
+        df_h['Date'] = pd.to_datetime(df_h['Date'], errors='coerce')
+        df_h = df_h.dropna(subset=['Date']).sort_values('Date')
+        
+        def safe_float_col(x):
+            try: 
+                s = str(x).replace(',', '').replace('$', '').replace(' ', '')
+                return float(s)
+            except: return 0.0
+            
+        df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float_col)
+        df_h['Principal'] = df_h['Principal'].apply(safe_float_col)
+        
+        current_date = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+        new_row = pd.DataFrame([{
+            'Date': pd.to_datetime(current_date),
+            'NetAsset': net_asset,
+            'Principal': data['principal']
+        }])
+        
+        if not df_h.empty and df_h.iloc[-1]['Date'].strftime('%Y-%m-%d') == current_date:
+            df_h.iloc[-1, df_h.columns.get_loc('NetAsset')] = net_asset
+            df_h.iloc[-1, df_h.columns.get_loc('Principal')] = data['principal']
+        else:
+            df_h = pd.concat([df_h, new_row], ignore_index=True)
+
+        view_type = st.radio("顯示模式", ["💰 淨資產走勢 (金額)", "📈 累計報酬率比較 (%)"], horizontal=True)
+        
+        fig_trend = go.Figure()
+        
+        if view_type == "💰 淨資產走勢 (金額)":
+            fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['NetAsset'], name='淨資產', fill='tozeroy', line=dict(color='#00CC96')))
+            fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['Principal'], name='投入本金', line=dict(color='#EF553B', dash='dot')))
+            fig_trend.update_layout(yaxis_title="金額 (TWD)")
+        else:
+            df_h['ROI'] = ((df_h['NetAsset'] - df_h['Principal']) / df_h['Principal']) * 100
+            fig_trend.add_trace(go.Scatter(x=df_h['Date'], y=df_h['ROI'], name='我的投資組合', line=dict(color='#00CC96', width=3)))
+            
+            if not df_h.empty:
+                start_date = df_h['Date'].iloc[0].strftime('%Y-%m-%d')
+                benchmarks = get_benchmark_data(start_date)
+                colors = ['#636EFA', '#AB63FA', '#FFA15A']
+                for i, (name, series) in enumerate(benchmarks.items()):
+                    fig_trend.add_trace(go.Scatter(x=series.index, y=series.values, name=name, line=dict(color=colors[i%len(colors)], width=1.5, dash='dot')))
+            
+            fig_trend.update_layout(yaxis_title="累計報酬率 (%)")
+
+        fig_trend.update_layout(hovermode="x unified", height=450)
+        st.plotly_chart(fig_trend, use_container_width=True)
+    else:
+        st.info("尚無歷史資產資料 (請執行一次更新即時股價以建立紀錄)")
+
+with tab4:
+    realized = data.get('history', [])
+    if realized:
+        df_r = pd.DataFrame(realized)
+        st.dataframe(df_r, use_container_width=True, hide_index=True)
+    else:
+        st.info("尚無已實現損益紀錄")
