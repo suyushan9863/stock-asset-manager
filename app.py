@@ -5,7 +5,7 @@ import requests
 import time
 import json
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials # 改用這個新版驗證
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v7.0 (Original Restored + Fixes)"
+APP_VERSION = "v7.1 (Safety Guard Edition)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -25,41 +25,58 @@ if 'app_version' not in st.session_state or st.session_state.app_version != APP_
     st.session_state.app_version = APP_VERSION
 
 # 設定頁面配置
-st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="📈")
+st.set_page_config(page_title=f"資產管家 Pro {APP_VERSION}", layout="wide", page_icon="🛡️")
 
-# --- Google Sheets 連線與資料處理 ---
+# --- Google Sheets 連線與資料處理 (已修復版) ---
 def get_google_client():
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        # 定義範圍
+        scope = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        
         secret_info = st.secrets["service_account_info"]
+        
+        # 判斷 secret 是字串還是 dict
         if isinstance(secret_info, str):
-            creds_dict = json.loads(secret_info, strict=False)
+            creds_dict = json.loads(secret_info)
         else:
             creds_dict = secret_info
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        return gspread.authorize(creds)
+            
+        # 使用新的驗證方式
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        client = gspread.authorize(creds)
+        return client
     except Exception as e:
-        st.error(f"連線 Google Sheets 失敗: {e}")
-        return None
+        st.error(f"❌ Google Sheet 連線失敗: {e}")
+        st.stop() # 連線失敗直接停止，保護資料
 
-def get_worksheet(client, sheet_name, rows="100", cols="10", default_header=None):
+def get_worksheet(spreadsheet, sheet_name, rows="100", cols="10", default_header=None):
+    try:
+        return spreadsheet.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=rows, cols=cols)
+        if default_header: ws.append_row(default_header)
+        return ws
+    except Exception as e:
+        st.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
+        st.stop() # 讀取分頁失敗也停止
+
+# --- 資料讀寫核心 (已修復：防止讀取失敗回傳空值) ---
+def load_data(client, username):
+    username = username.strip().lower() # 強制轉小寫
+    default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
+    
+    if not client or not username: return default
+
     try:
         spreadsheet = client.open(st.secrets["spreadsheet_name"])
-        try:
-            return spreadsheet.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title=sheet_name, rows=rows, cols=cols)
-            if default_header: ws.append_row(default_header)
-            return ws
     except Exception as e:
-        st.sidebar.error(f"讀取資料表 {sheet_name} 失敗: {str(e)}")
-        return None
+        st.error(f"❌ 無法開啟試算表: {st.secrets['spreadsheet_name']}。請檢查權限或檔名。錯誤: {e}")
+        st.stop() # 強制停止
 
-# --- 資料讀寫核心 ---
-def load_data(client, username):
-    default = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': []}
-    if not client or not username: return default
-    
+    # Helper: 清理數字
     def clean_num(val):
         try:
             if isinstance(val, (int, float)): return float(val)
@@ -68,81 +85,75 @@ def load_data(client, username):
             return float(s)
         except: return 0.0
 
-    # 1. 讀取 User Sheet (庫存)
-    user_ws = get_worksheet(client, f"User_{username}")
+    # 1. 讀取 User (庫存)
     h_data = {}
-    if user_ws:
+    try:
         try:
-            all_rows = user_ws.get_all_records()
-            for r in all_rows:
-                code = str(r.get('Code', '')).strip()
-                if not code: continue
-                
-                try: lots = json.loads(r.get('Lots_Data', '[]'))
-                except: lots = []
-                
-                if lots:
-                    calc_shares = sum(float(l.get('s', 0)) for l in lots)
-                    calc_cost_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
-                    calc_avg_cost = (calc_cost_val / calc_shares) if calc_shares > 0 else 0.0
-                    final_s = calc_shares
-                    final_c = calc_avg_cost
-                else:
-                    final_s = clean_num(r.get('Shares', 0))
-                    final_c = clean_num(r.get('AvgCost', 0))
-                
-                saved_last_p = clean_num(r.get('LastPrice', 0))
-                
-                h_data[code] = {
-                    'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
-                    's': final_s, 
-                    'c': final_c,
-                    'last_p': saved_last_p,
-                    'lots': lots
-                }
-        except Exception as e:
-            st.error(f"庫存資料解析失敗: {e}")
+            user_ws = spreadsheet.worksheet(f"User_{username}")
+        except gspread.exceptions.WorksheetNotFound:
+            # 只有確定是新用戶才回傳空值，不報錯
+            return default
+            
+        all_rows = user_ws.get_all_records()
+        for r in all_rows:
+            code = str(r.get('Code', '')).strip()
+            if not code: continue
+            
+            try: lots = json.loads(r.get('Lots_Data', '[]'))
+            except: lots = []
+            
+            final_s = clean_num(r.get('Shares', 0))
+            final_c = clean_num(r.get('AvgCost', 0))
+            
+            # 若有 lots 資料則以 lots 為準重算
+            if lots:
+                calc_s = sum(float(l.get('s', 0)) for l in lots)
+                calc_val = sum(float(l.get('s', 0)) * float(l.get('p', 0)) for l in lots)
+                final_s = calc_s
+                final_c = (calc_val / calc_s) if calc_s > 0 else 0.0
+            
+            h_data[code] = {
+                'n': r.get('Name', ''), 'ex': r.get('Exchange', ''),
+                's': final_s, 'c': final_c,
+                'last_p': clean_num(r.get('LastPrice', 0)),
+                'lots': lots
+            }
+    except Exception as e:
+        st.error(f"⚠️ 讀取庫存資料發生錯誤: {e}")
+        st.stop() # 讀取錯誤時強制停止，保護資料
 
-    # 2. 讀取 Account Sheet (資金)
-    acc_ws = get_worksheet(client, f"Account_{username}", rows="20", cols="2")
+    # 2. 讀取 Account (資金)
     acc_data = {}
-    if acc_ws:
-        try:
-            for row in acc_ws.get_all_values():
-                if len(row) >= 2: acc_data[row[0]] = row[1]
-        except: pass
+    try:
+        acc_ws = spreadsheet.worksheet(f"Account_{username}")
+        for row in acc_ws.get_all_values():
+            if len(row) >= 2: acc_data[row[0]] = row[1]
+    except Exception as e:
+        st.error(f"⚠️ 讀取帳戶資金失敗: {e}")
+        st.stop()
 
-    # 3. 讀取 Realized History
-    hist_ws = get_worksheet(client, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
+    # 3. 讀取歷史與已實現
     hist_data = []
-    if hist_ws:
+    asset_history = []
+    try:
         try:
-            raw_rows = hist_ws.get_all_values()
-            if len(raw_rows) > 1:
-                for row in raw_rows[1:]:
+            h_ws = spreadsheet.worksheet(f"Realized_{username}")
+            raw_h = h_ws.get_all_values()
+            if len(raw_h) > 1:
+                for row in raw_h[1:]:
                     row += [''] * (8 - len(row))
-                    hist_data.append({
-                        'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 
-                        'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 
-                        'Profit': row[6], 'ROI': row[7]
-                    })
+                    hist_data.append({'Date': str(row[0]), 'Code': str(row[1]), 'Name': str(row[2]), 'Qty': row[3], 'BuyCost': row[4], 'SellRev': row[5], 'Profit': row[6], 'ROI': row[7]})
         except: pass
 
-    # 4. 讀取 Asset History
-    asset_ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
-    asset_history = []
-    if asset_ws:
         try:
-            raw_rows = asset_ws.get_all_values()
-            if len(raw_rows) > 1:
-                for row in raw_rows[1:]:
+            a_ws = spreadsheet.worksheet(f"Hist_{username}")
+            raw_a = a_ws.get_all_values()
+            if len(raw_a) > 1:
+                for row in raw_a[1:]:
                     if len(row) >= 2:
-                        asset_history.append({
-                            'Date': str(row[0]),
-                            'NetAsset': clean_num(row[1]),
-                            'Principal': clean_num(row[2]) if len(row) > 2 else clean_num(row[1])
-                        })
+                        asset_history.append({'Date': str(row[0]), 'NetAsset': clean_num(row[1]), 'Principal': clean_num(row[2]) if len(row)>2 else clean_num(row[1])})
         except: pass
+    except: pass 
 
     return {
         'h': h_data,
@@ -154,16 +165,29 @@ def load_data(client, username):
         'asset_history': asset_history
     }
 
+# --- 存檔功能 (已修復：增加安全鎖) ---
 def save_data(client, username, data):
+    username = username.strip().lower()
     if not client: return
     
-    acc_ws = get_worksheet(client, f"Account_{username}")
-    if acc_ws:
+    # [核心安全鎖] 如果資料是空的，禁止寫入！
+    if data['cash'] == 0 and data['principal'] == 0 and not data['h']:
+        st.toast("⚠️ 偵測到資料異常為空，系統已自動攔截存檔操作！", icon="🛡️")
+        return
+
+    try:
+        spreadsheet = client.open(st.secrets["spreadsheet_name"])
+        
+        # 寫入資金
+        try: acc_ws = spreadsheet.worksheet(f"Account_{username}")
+        except: acc_ws = spreadsheet.add_worksheet(f"Account_{username}", 20, 2)
         acc_ws.clear()
         acc_ws.update('A1', [['Key', 'Value'], ['Cash', data['cash']], ['Principal', data['principal']], ['LastUpdate', data.get('last_update', '')], ['USDTWD', data.get('usdtwd', 32.5)]])
 
-    user_ws = get_worksheet(client, f"User_{username}")
-    if user_ws:
+        # 寫入庫存
+        try: user_ws = spreadsheet.worksheet(f"User_{username}")
+        except: user_ws = spreadsheet.add_worksheet(f"User_{username}", 100, 10)
+        
         headers = ['Code', 'Name', 'Exchange', 'Shares', 'AvgCost', 'Lots_Data', 'LastPrice']
         rows = [headers]
         for code, info in data.get('h', {}).items():
@@ -178,16 +202,25 @@ def save_data(client, username, data):
             ])
         user_ws.clear()
         user_ws.update('A1', rows)
+        
+    except Exception as e:
+        st.error(f"❌ 存檔失敗: {e}")
 
 def log_transaction(client, username, action, code, amount, shares, memo=""):
-    ws = get_worksheet(client, f"Audit_{username}", default_header=['Time', 'Action', 'Code', 'Amount', 'Shares', 'Memo'])
-    if ws:
+    username = username.strip().lower()
+    try:
+        spreadsheet = client.open(st.secrets["spreadsheet_name"])
+        ws = get_worksheet(spreadsheet, f"Audit_{username}", default_header=['Time', 'Action', 'Code', 'Amount', 'Shares', 'Memo'])
         ts = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y/%m/%d %H:%M:%S')
         ws.append_row([ts, action, code, amount, shares, memo])
+    except Exception as e:
+        print(f"Log Error: {e}")
 
 def record_asset_history(client, username, net_asset, principal):
-    ws = get_worksheet(client, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
-    if ws:
+    username = username.strip().lower()
+    try:
+        spreadsheet = client.open(st.secrets["spreadsheet_name"])
+        ws = get_worksheet(spreadsheet, f"Hist_{username}", default_header=['Date', 'NetAsset', 'Principal'])
         today = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
         all_vals = ws.get_all_values()
         if len(all_vals) > 1 and all_vals[-1][0] == today:
@@ -195,15 +228,20 @@ def record_asset_history(client, username, net_asset, principal):
             ws.update(f"B{row_idx}:C{row_idx}", [[net_asset, principal]])
         else:
             ws.append_row([today, net_asset, principal])
+    except Exception as e:
+        print(f"History Log Error: {e}")
 
 def get_audit_logs(client, username, limit=50):
-    ws = get_worksheet(client, f"Audit_{username}")
-    if ws:
+    username = username.strip().lower()
+    try:
+        spreadsheet = client.open(st.secrets["spreadsheet_name"])
+        ws = spreadsheet.worksheet(f"Audit_{username}")
         vals = ws.get_all_values()
         if len(vals) > 1: return vals[1:][-limit:][::-1]
+    except: pass
     return []
 
-# --- 股價抓取核心 (修正重點：TWSE 優先 + 正確昨收) ---
+# --- 股價抓取核心 ---
 @st.cache_data(ttl=300)
 def get_usdtwd():
     try:
@@ -230,7 +268,7 @@ def fetch_stock_price_robust(code, exchange=''):
     code = str(code).strip().upper()
     is_tw = ('.TW' in code) or ('.TWO' in code) or (code.isdigit())
     
-    # 優先嘗試台股 API (解決 00670L 價格錯誤與中文名稱問題)
+    # 優先嘗試台股 API
     if is_tw:
         clean_code = code.replace('.TW', '').replace('.TWO', '')
         queries = [f"tse_{clean_code}.tw", f"otc_{clean_code}.tw"]
@@ -242,24 +280,21 @@ def fetch_stock_price_robust(code, exchange=''):
             data = r.json()
             if 'msgArray' in data and len(data['msgArray']) > 0:
                 item = data['msgArray'][0]
-                # 取得成交價
                 z = item.get('z', '-')
                 if z == '-': z = item.get('b', '').split('_')[0]
                 if z == '-' or z == '': z = item.get('y', '0')
                 try: price = float(z)
                 except: price = 0.0
                 
-                # 取得昨日收盤價 (解決 -7% 錯誤的核心)
                 y_close = float(item.get('y', 0))
                 
                 if price > 0:
                     chg = price - y_close
                     pct = (chg / y_close * 100) if y_close > 0 else 0
-                    # 回傳中文名稱
                     return {'p': price, 'chg': chg, 'pct': pct, 'n': item.get('n', code), 'src': 'TWSE'}
         except Exception: pass
 
-    # 美股或台股 API 失敗才用 Yahoo
+    # Yahoo Backup
     yf_code = code
     if is_tw and '.TW' not in yf_code and '.TWO' not in yf_code: yf_code = f"{code}.TW"
     
@@ -268,10 +303,8 @@ def fetch_stock_price_robust(code, exchange=''):
         hist = t.history(period="1d")
         if not hist.empty:
             price = hist['Close'].iloc[-1]
-            try:
-                prev_close = t.info.get('regularMarketPreviousClose', price)
-            except:
-                prev_close = price
+            try: prev_close = t.info.get('regularMarketPreviousClose', price)
+            except: prev_close = price
         
             fetched_name = t.info.get('shortName') or t.info.get('longName') or code
             
@@ -315,7 +348,7 @@ if not st.session_state.current_user:
             if st.form_submit_button("Login", use_container_width=True):
                 users = st.secrets.get("passwords", {})
                 if u in users and str(users[u]) == str(p):
-                    st.session_state.current_user = u.strip()
+                    st.session_state.current_user = u.strip().lower() # 登入時也轉小寫
                     st.rerun()
                 else: st.error("Failed")
     st.stop()
@@ -368,8 +401,6 @@ with st.sidebar:
                     new_lot = {'d': datetime.now().strftime('%Y-%m-%d'), 'p': b_price, 's': b_qty, 'debt': debt}
                     
                     if b_code not in data['h']:
-                        # 買入時預設名稱：如果是台股，先給空字串，讓更新按鈕去抓中文
-                        # 美股則直接用 API 抓到的名字
                         init_name = "" if is_tw else info['n']
                         data['h'][b_code] = {'n': init_name, 'ex': ex_type, 's': 0, 'c': 0, 'lots': []}
                     
@@ -421,9 +452,12 @@ with st.sidebar:
                 
                 if h_curr['s'] <= 0: del data['h'][s_code]
                 
-                ws_hist = get_worksheet(client, f"Realized_{username}")
-                if ws_hist:
+                try:
+                    spreadsheet = client.open(st.secrets["spreadsheet_name"])
+                    ws_hist = get_worksheet(spreadsheet, f"Realized_{username}", default_header=['Date', 'Code', 'Name', 'Qty', 'BuyCost', 'SellRev', 'Profit', 'ROI'])
                     ws_hist.append_row([datetime.now().strftime('%Y-%m-%d'), s_code, h_curr.get('n'), s_qty, cost_basis, rev_twd, profit, (profit/cost_basis*100) if cost_basis else 0])
+                except: pass
+
                 save_data(client, username, data)
                 log_transaction(client, username, "賣出", s_code, s_price, s_qty)
                 st.success("賣出成功"); time.sleep(1); st.rerun()
@@ -451,12 +485,9 @@ for code, info in data['h'].items():
         if curr_p == 0: curr_p = info.get('c', 0)
         q = {'chg': 0, 'pct': 0, 'n': info.get('n', code)}
 
-    # --- 關鍵修正：防止名稱被覆寫 ---
-    # 只有當 (原本沒有名字) 或 (原本名字就是代碼) 時，才允許更新名稱
     current_name = str(info.get('n', '')).strip()
     if q.get('n') and (not current_name or current_name == code):
         info['n'] = q['n']
-    # -------------------------------
     
     s_code = str(code).upper()
     is_tw = ('.TW' in s_code) or ('.TWO' in s_code) or (s_code.replace('.TW','').replace('.TWO','').isdigit())
@@ -501,7 +532,6 @@ if st.button("🔄 更新即時股價", type="primary", use_container_width=True
         record_asset_history(client, username, net_asset, data['principal'])
         st.rerun()
 
-# --- 恢復完整面板 (資產 + 績效) ---
 st.subheader("🏦 資產概況")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("💰 淨資產", f"${net_asset:,.0f}")
@@ -519,7 +549,7 @@ def safe_sum_profit(val):
     except: return 0.0
 
 total_realized = sum(safe_sum_profit(r.get('Profit', 0) or r.get('profit', 0)) for r in data.get('history', []))
-total_profit_all = (net_asset - data['principal']) # 總損益 (含已實現)
+total_profit_all = (net_asset - data['principal']) 
 
 kp1, kp2, kp3, kp4 = st.columns(4)
 kp1.metric("📅 今日損益", f"${day_gain:,.0f}")
@@ -529,7 +559,6 @@ kp4.metric("📥 其中已實現", f"${total_realized:,.0f}")
 
 st.markdown("---")
 
-# --- UI 頁籤恢復 ---
 tab1, tab2, tab3, tab4 = st.tabs(["📋 庫存明細", "🗺️ 熱力圖", "📊 資產走勢", "📜 已實現損益"])
 
 def style_color(v):
@@ -583,7 +612,6 @@ with tab3:
         df_h['NetAsset'] = df_h['NetAsset'].apply(safe_float_col)
         df_h['Principal'] = df_h['Principal'].apply(safe_float_col)
         
-        # 同步當下最新的淨資產
         current_date = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
         new_row = pd.DataFrame([{
             'Date': pd.to_datetime(current_date),
