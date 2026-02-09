@@ -135,6 +135,9 @@ def load_data(client, username):
         acc_ws = spreadsheet.worksheet(f"Account_{username}")
         for row in acc_ws.get_all_values():
             if len(row) >= 2: acc_data[row[0]] = row[1]
+    except gspread.exceptions.WorksheetNotFound:
+        # 如果找不到帳戶頁面，不視為錯誤，使用預設值
+        pass
     except Exception as e:
         st.error(f"⚠️ 讀取帳戶資金失敗: {e}")
         st.stop()
