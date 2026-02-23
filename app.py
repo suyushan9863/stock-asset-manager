@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Version Control ---
-APP_VERSION = "v7.4 (Case-Insensitive Search Fix)"
+APP_VERSION = "v7.5 (Session Data Fix)"
 
 # 自動清除舊快取與 Session State
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
@@ -423,10 +423,15 @@ username = st.session_state.current_user
 client = get_google_client()
 if not client: st.error("Google Client Error"); st.stop()
 
-if 'data' not in st.session_state or st.session_state.get('loaded_user') != username:
+# 嚴格的資料加載與空值修復機制
+if 'data' not in st.session_state or not st.session_state.data or st.session_state.get('loaded_user') != username:
     st.session_state.data = load_data(client, username)
     st.session_state.loaded_user = username
 data = st.session_state.data
+
+# 防呆：如果 data 仍為異常值，給予預設結構防止出錯
+if not isinstance(data, dict):
+    data = {'h': {}, 'cash': 0.0, 'principal': 0.0, 'history': [], 'asset_history': [], 'is_legacy': False}
 
 # --- 自動遷移邏輯 ---
 if data.get('is_legacy', False):
